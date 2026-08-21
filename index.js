@@ -672,6 +672,9 @@ export async function apply(ctx) {
 
   // 官方数据缓存 + in-flight 合并 + 配置变更失效。
   // balance 缺失（get_user_summary 偶发失败）时用短 TTL，快速重试而非毒化缓存。
+  let officialCache = null
+  let lastOfficialError = null
+  let officialInFlight = null
   const BALANCE_WEAK_TTL_MS = 10_000
 
   async function officialSnapshot() {
