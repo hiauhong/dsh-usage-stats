@@ -670,10 +670,9 @@ export async function apply(ctx) {
     return d
   }
 
-  // 官方数据缓存 + in-flight 合并 + 配置变更失效
-  let officialCache = null
-  let lastOfficialError = null
-  let officialInFlight = null
+  // 官方数据缓存 + in-flight 合并 + 配置变更失效。
+  // balance 缺失（get_user_summary 偶发失败）时用短 TTL，快速重试而非毒化缓存。
+  const BALANCE_WEAK_TTL_MS = 10_000
 
   async function officialSnapshot() {
     // P1：每次查询前轻量检测配置文件变更（stat），变更立即应用配置、
@@ -688,7 +687,7 @@ export async function apply(ctx) {
     const gen = tokenState.configGeneration
     if (officialCache !== null
       && officialCache.generation === gen
-      && Date.now() - officialCache.at < CACHE_TTL_MS) {
+      && Date.now() - officialCache.at < (officialCache.weak ? BALANCE_WEAK_TTL_MS : CACHE_TTL_MS)) {
       return officialCache.data
     }
     // P1：in-flight 绑定 generation——配置已变则不复用旧 token 的请求
@@ -702,7 +701,11 @@ export async function apply(ctx) {
         // P1：完成时若配置代数已变，丢弃旧账号数据，不写缓存
         if (tokenState.configGeneration !== gen) return null
         if (data === null) return null
-        officialCache = { at: Date.now(), data, generation: gen }
+        if (data.balance === null) {
+          // 余额接口偶发失败：不静默——记日志 + 短 TTL 快速重试
+          ctx.logger.warn('usage-stats: balance unavailable (get_user_summary failed); will retry shortly')
+        }
+        officialCache = { at: Date.now(), data, generation: gen, weak: data.balance === null }
         lastOfficialError = null
         return data
       } catch (err) {
