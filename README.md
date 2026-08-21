@@ -3,6 +3,8 @@
 DeepSeek Harness 插件：侧边栏左下角（设置按钮上方）显示**今日 / 本月** token
 消耗、费用与**账户余额**。
 
+点击卡片标题「用量信息↗」可打开 DeepSeek 开放平台，查看官方详细用量数据。
+
 ## 效果预览
 
 ![效果预览](example.png)
@@ -40,7 +42,7 @@ Local Storage → `https://platform.deepseek.com` → 复制 `userToken` 的 val
 - **官方口径**（配置 token 后）：与 platform.deepseek.com/usage 页面一致，
   为账号全量数据（含其他客户端用量）
 - **本地口径**（兜底）：只统计 DSH 自己花掉的用量，费用为估算
-- 卡片显示「官方」徽标表示当前是官方数据；点击「用量信息↗」打开官方用量页
+- 卡片显示「官方」徽标表示当前是官方数据
 
 ## 卸载
 
