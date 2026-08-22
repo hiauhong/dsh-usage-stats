@@ -110,7 +110,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
             React.createElement('span', { className: 'dshus-link' }, '↗'),
             data !== null && data.source === 'official'
               ? React.createElement('span', { className: 'dshus-badge' }, '官方')
-              : null),
+              : data !== null && data.source === 'local'
+                ? React.createElement('span', { className: 'dshus-badge' }, '估算')
+                : null),
           data !== null && data.balance !== null && data.balance !== undefined
             ? React.createElement('span', { className: 'dshus-balance' }, formatBalance(data.balance.amount, data.balance.currency))
             : null)
@@ -130,11 +132,12 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           React.createElement('span', { className: 'dshus-cost' }, formatMoney(data.month.cost, data.currency)))
 
         if (wide) {
-          return React.createElement('div', { className: 'dshus-block' }, head, todayLine, monthLine)
+          return React.createElement('div', { className: 'dshus-block' }, head, todayLine, monthLine,
+            data.scanHint ? React.createElement('div', { className: 'dshus-loading' }, data.scanHint) : null)
         }
         return React.createElement('div', {
           className: 'dshus-rail',
-          title: `今日 ${formatCompactTokens(data.today.tokens)} tok · ${formatMoney(data.today.cost, data.currency)}，本月 ${formatCompactTokens(data.month.tokens)} tok`,
+          title: `今日 ${formatCompactTokens(data.today.tokens)} tok · ${formatMoney(data.today.cost, data.currency)}，本月 ${formatCompactTokens(data.month.tokens)} tok${data.scanHint ? `\n${data.scanHint}` : ''}`,
         }, `Σ ${formatCompactTokens(data.today.tokens)}`)
       }
 

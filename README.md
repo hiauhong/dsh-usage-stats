@@ -37,6 +37,26 @@ Local Storage → `https://platform.deepseek.com` → 复制 `userToken` 的 val
 { "autoScan": true }
 ```
 
+### autoScan 工作原理与已知限制
+
+autoScan 会读取各浏览器 profile 的 `Local Storage/leveldb`，启发式提取
+`platform.deepseek.com` 的 `userToken` 候选，再逐个发往 DeepSeek 校验，选有效的那个。
+
+因为 Chrome 的 LevelDB 在压缩（compaction）时可能把一条记录的 **key 和 value 分散到
+不同 SSTable 文件**，且 localStorage 值实际以 `{"value":"...","__version":"0"}` 形式存储，
+纯文本扫描有时抓不到（或抓到**其他网站的旧 token**，校验会返回 40003 无效）。
+
+插件为此做了两处收敛（`scanBrowserTokens`）：
+
+- 优先收集**含 `platform.deepseek.com` origin 文件**里、长度在 `55–85` 的独立 base64
+  运行（按接近 65 排序），能命中有效 token 并天然排除其他网站/旧记录的 token；
+- 再用 `userToken` key / origin / `"value":"` **marker 邻近候选**兜底；
+- 候选上限 `MAX_CANDIDATES`（40），并记住"已穷尽"状态，避免无有效 token 时每次查询
+  重复校验全部候选。
+
+**仍非 100% 可靠**（跨 SSTable 是 Chrome 固有限制）。若 autoScan 显示
+`scanHint`（未找到有效 token），最稳的做法是手动填 `platformToken`。
+
 ## 数据来源
 
 - **官方口径**（配置 token 后）：与 platform.deepseek.com/usage 页面一致，

@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import { readdirSync, readFileSync, statSync, chmodSync } from 'node:fs'
 
 export const name = 'usage-stats'
-export const inject = ['sessionQuery', 'webServer']
+export const inject = ['webServer']
 
 const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
 const NEW_PRICING_AT = Date.parse('2026-08-17T00:00:00+08:00')
@@ -81,7 +81,7 @@ const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 
 const resolveModel = (provider, model) => (OFFICIAL_PROVIDERS.has(provider) ? MODEL_ALIASES[model] : undefined)
 
 // ---------------------------------------------------------------------------
-// 本地统计：回放 + 实时
+// 本地统计：实时（llm/stream 累加，轻量；官方数据为准，本地仅兜底）
 // ---------------------------------------------------------------------------
 
 function applyUsage(days, provider, model, usage, time) {
@@ -112,90 +112,6 @@ function applyUsage(days, provider, model, usage, time) {
   const keys = Object.keys(days)
   if (keys.length > MAX_DAY_BUCKETS) {
     keys.sort().slice(0, keys.length - MAX_DAY_BUCKETS).forEach((k) => { delete days[k] })
-  }
-}
-
-function foldEvent(state, event) {
-  // P3：损坏事件的时间戳不进入折叠（避免 NaN-NaN-NaN 日期桶污染统计）
-  if (typeof event.time !== 'number' || !Number.isFinite(event.time)) return
-  // 逐事件字段校验：异常事件只跳过自身，不影响整个会话折叠
-  if (event.type === 'request/header') {
-    const config = event.data && event.data.header && event.data.header.config
-    if (typeof config !== 'object' || config === null) return
-    state.route = { provider: config.provider, model: config.model }
-    return
-  }
-  if (event.type === 'step/start') {
-    const turn = Number(event.data && event.data.turn)
-    const step = Number(event.data && event.data.step)
-    if (!Number.isFinite(turn) || !Number.isFinite(step)) return
-    state.open = {
-      turn,
-      step,
-      time: event.time,
-      provider: state.route.provider,
-      model: state.route.model,
-    }
-    return
-  }
-  if (event.type === 'assistant/message') {
-    const open = state.open
-    const matches = open !== null && open.turn === event.data.turn && open.step === event.data.step
-    const provider = matches ? open.provider : state.route.provider
-    const model = matches ? open.model : state.route.model
-    const time = matches ? open.time : event.time
-    // 水印：请求开始时间晚于水印的事件由实时流负责，回放跳过（防双计）
-    if (event.data.usage !== undefined && time < state.watermark) {
-      applyUsage(state.days, provider, model, event.data.usage, time)
-    }
-    state.open = null
-    return
-  }
-  if (event.type === 'step/end') {
-    if (state.open !== null && state.open.turn === event.data.turn && state.open.step === event.data.step) state.open = null
-    return
-  }
-  if (event.type === 'compaction/start') {
-    // 记录 compaction 起始时间，summary 按起始时间归属（跨水印不遗漏）。
-    // 官方文档中 compactionId 属于 CompactionResult，事件载荷可能带也可能不带；
-    // 因此主路径先尝试用 compactionId 关联，兜底记录串行 pending 起始时间，
-    // 任何 schema 下跨水印 compaction 都能正确归属。
-    const id = event.data && event.data.compactionId
-    if (id !== undefined && id !== null) {
-      state.compactionStart = state.compactionStart || new Map()
-      state.compactionStart.set(id, event.time)
-    }
-    state.pendingCompactionStart = event.time
-    return
-  }
-  if (event.type === 'compaction/end') {
-    // 清理已结束 compaction 的起始时间，防止 Map 无界增长
-    const id = event.data && event.data.compactionId
-    if (state.compactionStart && id !== undefined && id !== null) state.compactionStart.delete(id)
-    state.pendingCompactionStart = undefined
-    return
-  }
-  if (event.type === 'compaction/summary' && event.data.usage !== undefined) {
-    // 归属时间优先级：compactionId 映射 → 串行 pending 起始时间 → summary 事件时间；
-    // 与实时流按"调用开始时间"分区的口径一致，跨水印 compaction 不漏计。
-    const mapped = state.compactionStart && state.compactionStart.get(event.data.compactionId)
-    const startTime = mapped ?? state.pendingCompactionStart ?? event.time
-    if (startTime < state.watermark) {
-      applyUsage(state.days, event.data.provider, event.data.model, event.data.usage, startTime)
-    }
-  }
-}
-
-/** 折叠单个会话的水印前事件到 per 日桶（纯新增，调用方负责换新对象）。 */
-async function foldSession(ctx, sessionId, watermark, per) {
-  const snap = await ctx.sessionQuery.readSession(sessionId)
-  const state = { route: { provider: '', model: '' }, open: null, days: per, watermark, compactionStart: new Map() }
-  for (const event of snap.events) {
-    try {
-      foldEvent(state, event)
-    } catch (err) {
-      // 单条异常事件不拖垮整个会话
-    }
   }
 }
 
@@ -278,10 +194,44 @@ const BROWSER_ROOTS = [
   join(homedir(), 'Library', 'Application Support', 'Arc'),
 ]
 const BROWSER_SCAN_MAX_BYTES = 64 * 1024 * 1024 // 单文件上限 64MB
+// DeepSeek userToken 长度区间（实测 64/66 字符；放宽范围以防变化）。
+// localStorage 值形如 {"value":"...","__version":"0"}，token 主体是 base64 运行。
+const TOKEN_LEN_MIN = 55
+const TOKEN_LEN_MAX = 85
+const MAX_CANDIDATES = 40 // 候选上限：约束"无有效 token"时逐候选校验的成本
 
-function scanBrowserTokens() {
-  const found = []
+/** 从一段文本里提取一个 base64 token 候选（优先解析 JSON `{"value":"..."}`，兜底裸 base64）。 */
+function tokenCandidateFrom (segment) {
+  const jm = segment.match(/"value"\s*:\s*"([A-Za-z0-9+/=]{40,200})"/)
+  if (jm) return jm[1]
+  const rm = segment.match(/[A-Za-z0-9+/=]{40,200}/)
+  return rm ? rm[0] : null
+}
+
+/** 在文本中查找 marker（userToken key / deepseek origin / "value":" JSON）邻近的候选。 */
+function extractNearMarkers (text) {
+  const out = []
   const seen = new Set()
+  const add = (v) => { if (v && !seen.has(v)) { seen.add(v); out.push(v) } }
+  for (const needle of ['userToken', 'platform.deepseek.com', '"value":"']) {
+    let idx = 0
+    while ((idx = text.indexOf(needle, idx)) !== -1) {
+      const candidate = tokenCandidateFrom(text.slice(idx, idx + 400))
+      if (candidate) add(candidate)
+      idx += needle.length
+    }
+  }
+  return out
+}
+
+function scanBrowserTokens () {
+  // primary：含 platform.deepseek.com origin 的文件里的合理长度候选——最可靠，
+  // 实测能命中有效 token 并天然排除其他网站/旧记录的 token。
+  const primary = []
+  const primarySeen = new Set()
+  // fallback：marker 邻近候选（覆盖 key/value 跨 SSTable 且文件缺 origin 的场景）
+  const fallback = []
+  const fallbackSeen = new Set()
   for (const root of BROWSER_ROOTS) {
     let profiles = []
     try {
@@ -308,23 +258,28 @@ function scanBrowserTokens() {
         } catch (err) {
           continue
         }
-        // 注意：userToken 记录与 origin 前缀可能不在同一个 SSTable 文件，
-        // 所以不做 platform.deepseek.com 预过滤，直接按键名找。
         const text = buf.toString('latin1')
-        let idx = 0
-        while ((idx = text.indexOf('userToken', idx)) !== -1) {
-          const seg = text.slice(idx, idx + 320)
-          const match = seg.match(/[A-Za-z0-9+/=]{40,200}/)
-          if (match && !seen.has(match[0])) {
-            seen.add(match[0])
-            found.push(match[0])
-          }
-          idx += 9
+        const hasOrigin = text.includes('platform.deepseek.com')
+        // 独立 base64 运行：用 {40,200} 取完整运行（避免长二进制子串的假阳性），再按长度收敛。
+        // 只在含 deepseek origin 的文件里收（排除其他网站/旧记录的 token 假阳性）。
+        const re = /[A-Za-z0-9+/=]{40,200}/g
+        let m
+        while ((m = re.exec(text)) !== null) {
+          const len = m[0].length
+          if (len < TOKEN_LEN_MIN || len > TOKEN_LEN_MAX) continue
+          if (hasOrigin && !primarySeen.has(m[0])) { primarySeen.add(m[0]); primary.push(m[0]) }
+        }
+        // marker 邻近候选兜底（key / origin / JSON）
+        for (const v of extractNearMarkers(text)) {
+          if (v && !primarySeen.has(v) && !fallbackSeen.has(v)) { fallbackSeen.add(v); fallback.push(v) }
         }
       }
     }
   }
-  return found
+  // primary 按长度接近 65 排序（实测 token 64/66），让最可能先被校验
+  primary.sort((a, b) => Math.abs(a.length - 65) - Math.abs(b.length - 65))
+  // 限制候选总量：正常情况有效 token 位于前段；同时约束"无有效 token"时的校验成本
+  return [...primary, ...fallback].slice(0, MAX_CANDIDATES)
 }
 
 function isAuthError(payload) {
@@ -357,6 +312,7 @@ const tokenState = {
   autoScan: false,     // 是否启用浏览器自动扫描（opt-in）
   configCheckedAt: 0,  // 上次重读配置文件时间
   scanCheckedAt: 0,    // 上次扫描浏览器时间
+  exhaustedAt: null,   // 上次全量校验候选且无有效 token 的时间（避免每次查询重复校验）
   candidates: [],      // 浏览器扫描到的候选
   browserValid: null,  // 已验证有效的浏览器 token
   configGeneration: 0, // 配置每变化一次 +1，官方缓存据此失效
@@ -411,6 +367,7 @@ async function resolveToken(forceRescan = false) {
     tokenState.candidates = tokenState.autoScan ? scanBrowserTokens() : []
     // P2：候选集刷新后必须淘汰旧 browserValid——用户切换账号后不再沿用旧 token
     tokenState.browserValid = null
+    tokenState.exhaustedAt = null // 新候选集，重置"无有效 token"记忆
   }
   // 1) 手动配置：已验证则直接复用（auth 失败才会被置失效）
   if (tokenState.manual !== null && tokenState.manualValid) return tokenState.manual
@@ -423,10 +380,15 @@ async function resolveToken(forceRescan = false) {
   }
   // 2) 浏览器自动获取：优先复用已验证的，否则逐候选校验
   if (tokenState.browserValid !== null) return tokenState.browserValid
-  for (const candidate of tokenState.candidates) {
-    if (await isValidToken(candidate)) {
-      tokenState.browserValid = candidate
-      return candidate
+  // 已全量校验过且无有效 token：在下次扫描前不再重复校验，避免每次查询都校验全部候选
+  if (forceRescan || tokenState.exhaustedAt === null || now - tokenState.exhaustedAt > BROWSER_SCAN_MS) {
+    tokenState.exhaustedAt = now
+    for (const candidate of tokenState.candidates) {
+      if (await isValidToken(candidate)) {
+        tokenState.browserValid = candidate
+        tokenState.exhaustedAt = null
+        return candidate
+      }
     }
   }
   return null
@@ -564,10 +526,9 @@ async function fetchOfficial() {
 // ---------------------------------------------------------------------------
 
 export async function apply(ctx) {
-  // 水印：实时流负责 [watermark, ∞)，回放负责 [0, watermark)，两者不重叠
+  // 本地估算：只用实时 llm/stream 累加（轻量）。以官方数据为准，本地仅兜底。
+  // 不再做会话回放/尾扫 —— 那会周期性同步读+解析会话日志，偶发卡住事件循环。
   const watermark = Date.now()
-  const TAIL_FIRST_MS = 30_000 // 首次尾扫延迟（等多数 in-flight 落盘）
-  const TAIL_SCAN_MS = 60_000 // 持续尾扫周期（覆盖长请求晚落盘）
 
   // ---- 实时流（立即接入，只统计水印后开始的请求） ----
   const daysLive = {}
@@ -584,88 +545,9 @@ export async function apply(ctx) {
     })()
   })
 
-  // ---- 回放（只折叠水印前事件）：串行链 + 持续尾扫 + 失败保留上次 ----
-  let daysPre = {}
-  let replayChain = Promise.resolve()
-  // 尾扫只重折叠活跃会话，但 daysPre 必须由"全部会话的聚合"重建，
-  // 否则会抹掉已结束会话的历史。故按 session 维护聚合，未重扫的会话保留原值。
-  const sessionFolds = new Map() // sessionId -> 该会话水印前的日桶
-  let pendingIds = new Set() // 待尾扫会话：初次活跃、可能仍产生水印前事件（含刚关闭）
-  const runReplay = (liveOnly) => {
-    replayChain = replayChain.then(async () => {
-      try {
-        const sessions = await ctx.sessionQuery.listSessions()
-        const currentIds = new Set()
-        const currentLive = new Set()
-        for (const record of sessions) {
-          currentIds.add(record.header.id)
-          if (record.live === true) currentLive.add(record.header.id)
-        }
-        // 尾扫折叠集合 = pending（初次活跃、可能仍会产生水印前事件）∪ 当前活跃。
-        // pending 保留到会话"被折叠过一次且已不再活跃"才移除，防止
-        // "初次回放时请求在途 → 会话在下一次尾扫前关闭"的永久漏计。
-        const toFold = liveOnly
-          ? new Set([...pendingIds, ...currentLive])
-          : currentIds
-        for (const id of toFold) {
-          const per = {}
-          try {
-            await foldSession(ctx, id, watermark, per)
-            sessionFolds.set(id, per) // 成功才更新该会话
-          } catch (err) {
-            // 该会话保持上次成功值；不中断整体
-            ctx.logger.warn(`usage-stats: skip session ${id}: ${String(err)}`)
-          }
-        }
-        // 更新 pending：仍活跃的保留 + 新出现的活跃会话加入；
-        // 刚关闭的会话本轮已被折叠（终态），从 pending 移除。
-        if (liveOnly) {
-          const next = new Set()
-          for (const id of pendingIds) if (currentLive.has(id)) next.add(id)
-          for (const id of currentLive) next.add(id)
-          pendingIds = next
-        } else {
-          pendingIds = new Set(currentLive)
-        }
-        // GC：已删除的会话从聚合中移除
-        for (const id of sessionFolds.keys()) {
-          if (!currentIds.has(id)) sessionFolds.delete(id)
-        }
-        // 重建 daysPre = 全部会话聚合（含未重扫的已结束会话，历史不丢）
-        const fresh = {}
-        for (const per of sessionFolds.values()) mergeDays(fresh, per)
-        daysPre = fresh
-      } catch (err) {
-        // 列表失败：保留上一次成功的 daysPre，不清空
-        ctx.logger.warn(`usage-stats: replay failed: ${String(err)}`)
-      }
-    })
-    return replayChain
-  }
-  runReplay(false) // 初次全量回放
-
-  // 持续尾扫：定期重建 daysPre（替换而非累加，避免双计），覆盖
-  // "水印前启动、落盘晚"的长请求；串行链保证结果有序。
-  // 尾扫只重读活跃会话（新事件只发生在活跃会话），降低持续 I/O。
-  let tailTimer = null
-  let disposed = false
-  const scheduleTail = (delay) => {
-    tailTimer = setTimeout(() => {
-      if (disposed) return
-      runReplay(true).then(() => { if (!disposed) scheduleTail(TAIL_SCAN_MS) })
-    }, delay)
-  }
-  scheduleTail(TAIL_FIRST_MS)
-  ctx.effect(() => () => {
-    // 阻止已触发的回调在卸载后再次调度
-    disposed = true
-    if (tailTimer !== null) clearTimeout(tailTimer)
-  }, 'usage-stats: tail scan timer')
-
-  // 合并视图：回放与实时按水印互斥，按日键相加即可
+  // 合并视图：本地估算只用实时累加的日桶（复制一份，避免外部误改 live 桶）
   const mergedDays = () => {
     const d = {}
-    mergeDays(d, daysPre)
     mergeDays(d, daysLive)
     return d
   }
@@ -784,6 +666,12 @@ export async function apply(ctx) {
             payload.balance = official.balance
           } else {
             payload.officialError = '官方数据暂不可用'
+            // P2-4：autoScan 开着却拿不到有效 token 时，明确提示（避免默默兜底让人困惑）
+            if (tokenState.autoScan) {
+              payload.scanHint = tokenState.candidates.length === 0
+                ? 'autoScan 未在浏览器里找到 userToken，请登录 platform.deepseek.com 后重试，或手动配置 platformToken'
+                : 'autoScan 找到的候选均无效（可能含过期/其他网站的 token），建议手动配置 platformToken'
+            }
           }
           send(200, payload)
         } catch (err) {
