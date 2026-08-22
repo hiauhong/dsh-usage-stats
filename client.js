@@ -45,7 +45,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         .dshus-head {
           display: flex; align-items: center; gap: 0; min-width: 0;
           text-decoration: none; color: var(--dsw-alias-label-primary);
-          border-radius: 4px; padding: 1px 2px; align-self: flex-start;
+          border-radius: 4px; padding: 1px 2px 1px 0; align-self: flex-start;
         }
         .dshus-head:hover { color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); }
         .dshus-title { min-width: 0; font-size: 11px; font-weight: 600; line-height: 1.4; }
