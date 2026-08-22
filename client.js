@@ -35,7 +35,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         [class*="footerActions"] { flex-wrap: wrap; }
         .dshus-block {
           display: flex; flex-direction: column; gap: 3px; flex: 0 0 100%;
-          min-width: 0; padding: 7px 10px; box-sizing: border-box;
+          min-width: 0; padding: 7px var(--dsh-sidebar-inline-padding); box-sizing: border-box;
           font-size: 11px; line-height: 1.4; color: var(--dsw-alias-label-primary);
         }
         .dshus-headrow {
