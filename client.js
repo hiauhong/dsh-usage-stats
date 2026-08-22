@@ -62,7 +62,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           border-radius: 3px; padding: 2px 4px; align-self: center;
         }
         .dshus-balance {
-          flex: none; font-size: 10px; color: var(--dsw-alias-label-secondary);
+          flex: none; color: var(--dsw-alias-label-secondary);
           font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
         .dshus-row { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
