@@ -27,6 +27,12 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       return `余额 ${symbol}${amount.toFixed(2)}`
     }
 
+    // 当前价格档位（与官方一致：北京 9-12、14-18 为高峰，其余空闲；高峰价=2×空闲）
+    function pricingTier() {
+      const h = new Date(Date.now() + 8 * 60 * 60 * 1000).getUTCHours()
+      return (h >= 9 && h < 12) || (h >= 14 && h < 18) ? '高峰' : '空闲'
+    }
+
     module.exports.inject = ['slots']
 
     module.exports.apply = function apply(ctx) {
@@ -112,7 +118,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
               ? React.createElement('span', { className: 'dshus-badge' }, '官方')
               : data !== null && data.source === 'local'
                 ? React.createElement('span', { className: 'dshus-badge' }, '估算')
-                : null),
+                : null,
+            data !== null
+              ? React.createElement('span', { className: 'dshus-badge' }, pricingTier())
+              : null),
           data !== null && data.balance !== null && data.balance !== undefined
             ? React.createElement('span', { className: 'dshus-balance' }, formatBalance(data.balance.amount, data.balance.currency))
             : null)
