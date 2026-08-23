@@ -19,6 +19,8 @@ export const inject = ['webServer']
 
 const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
 const NEW_PRICING_AT = Date.parse('2026-08-17T00:00:00+08:00')
+// 2026-08-23 起周末（周六/周日）全天不再区分峰谷，统一按低谷（空闲）价计费
+const WEEKEND_PRICING_AT = Date.parse('2026-08-23T00:00:00+08:00')
 const MAX_DAY_BUCKETS = 370
 const OFFICIAL_PROVIDERS = new Set(['deepseek-official', 'session-title-first-prompt-llm'])
 
@@ -62,7 +64,13 @@ function beijingDayKey(time) {
 
 function peakMultiplier(time) {
   if (time < NEW_PRICING_AT) return 1
-  const h = new Date(time + BEIJING_OFFSET_MS).getUTCHours()
+  const d = new Date(time + BEIJING_OFFSET_MS)
+  const h = d.getUTCHours()
+  // 2026-08-23 起：周末全天低谷价（高峰倍率 1）；工作日维持 9-12、14-18 高峰×2
+  if (time >= WEEKEND_PRICING_AT) {
+    const day = d.getUTCDay() // 0=周日, 6=周六
+    if (day === 0 || day === 6) return 1
+  }
   return (h >= 9 && h < 12) || (h >= 14 && h < 18) ? 2 : 1
 }
 

@@ -27,9 +27,13 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       return `余额 ${symbol}${amount.toFixed(2)}`
     }
 
-    // 当前价格档位（与官方一致：北京 9-12、14-18 为高峰，其余空闲；高峰价=2×空闲）
+    // 当前价格档位（与官方一致：工作日北京 9-12、14-18 为高峰，其余空闲；高峰价=2×空闲；
+    // 2026-08-23 起周末全天不再区分峰谷，统一按空闲（低谷）价）
     function pricingTier() {
-      const h = new Date(Date.now() + 8 * 60 * 60 * 1000).getUTCHours()
+      const now = new Date(Date.now() + 8 * 60 * 60 * 1000)
+      const h = now.getUTCHours()
+      const day = now.getUTCDay() // 0=周日, 6=周六
+      if (day === 0 || day === 6) return '空闲'
       return (h >= 9 && h < 12) || (h >= 14 && h < 18) ? '高峰' : '空闲'
     }
 
