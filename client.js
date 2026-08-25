@@ -17,14 +17,19 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       return `${(value / 1_000_000_000).toFixed(2)}B`
     }
 
+    // 与平台页一致：金额去尾（截断）到 2 位小数，而非四舍五入——避免"多 0.01"
+    function truncate2(value) {
+      return Math.floor(value * 100 + 1e-6) / 100
+    }
+
     function formatMoney(value, currency) {
       const symbol = currency === 'CNY' ? '¥' : currency === 'USD' ? '$' : (currency ? `${currency} ` : '')
-      return `${symbol}${value.toFixed(2)}`
+      return `${symbol}${truncate2(value).toFixed(2)}`
     }
 
     function formatBalance(amount, currency) {
       const symbol = currency === 'CNY' ? '￥' : currency === 'USD' ? '$' : (currency ? `${currency} ` : '')
-      return `余额 ${symbol}${amount.toFixed(2)}`
+      return `余额 ${symbol}${truncate2(amount).toFixed(2)}`
     }
 
     // 当前价格档位（与官方一致：工作日北京 9-12、14-18 为高峰，其余空闲；高峰价=2×空闲；
