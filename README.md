@@ -1,9 +1,11 @@
 # dsh-usage-stats
 
 DeepSeek Harness 插件：侧边栏左下角（设置按钮上方）显示**今日 / 本月** token
-消耗、费用与**账户余额**。
+消耗、费用与**账户余额**；并在左上角品牌行（`deepseek HARNESS` 右侧）检测
+**是否有新版** DSH，有则显示「有新版」徽章。
 
 点击卡片标题「用量信息↗」可打开 DeepSeek 开放平台，查看官方详细用量数据。
+点击「有新版」徽章可打开 [deepseek-harness Releases](https://github.com/deepseek-ai/deepseek-harness/releases)。
 
 ## 效果预览
 
@@ -56,6 +58,18 @@ autoScan 会读取各浏览器 profile 的 `Local Storage/leveldb`，启发式�
 
 **仍非 100% 可靠**（跨 SSTable 是 Chrome 固有限制）。若 autoScan 显示
 `scanHint`（未找到有效 token），最稳的做法是手动填 `platformToken`。
+
+## 检测新版
+
+插件在左上角品牌行（`deepseek HARNESS` 右侧）检测 DSH 是否有新版：
+
+- **判定**：读取运行中 DSH 的版本（与 `dsh --version` 同源，取自其 `package.json`），
+  对比 npm 上 `@deepseek-ai/dsh` 的 `dist-tags.latest`；最新版比本地新即显示「有新版」，
+  无更新则隐藏。支持 `-rc.N` 预发布版本比较。
+- **频率**：本地缓存 1 小时、页面低频轮询（版本变更极低频），避免频繁请求 npm。
+- **点击**：只跳转 [deepseek-harness Releases](https://github.com/deepseek-ai/deepseek-harness/releases)，
+  不会误触发品牌行的「新建会话」（已做点击冒泡隔离）。
+- 失败的 npm 请求不会被缓存，下次自动重试。
 
 ## 数据来源
 

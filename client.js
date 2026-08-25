@@ -8,7 +8,11 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
 
     const USAGE_URL = 'https://platform.deepseek.com/usage'
     const QUERY_ROUTE = '/api/usage-stats/query'
+    const UPDATE_ROUTE = '/api/usage-stats/update'
     const REFRESH_MS = 60000
+    const UPDATE_POLL_MS = 3600 * 1000 // 版本检测低频：1 小时一轮
+    const UPDATE_BADGE_TEXT = '有新版'
+    const UPDATE_BADGE_CLASS = 'dshus-upd-badge'
 
     function formatCompactTokens(value) {
       if (value < 1_000) return String(Math.round(value))
@@ -86,6 +90,15 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           font-size: 10px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary);
         }
         .dshus-loading { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
+        .dshus-upd-badge {
+          flex: none; align-self: center;
+          font-size: 9px; line-height: 1; font-weight: 400;
+          color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-1);
+          border-radius: 3px; padding: 2px 5px;
+          white-space: nowrap; text-decoration: none; cursor: pointer;
+          position: relative; z-index: 1;
+        }
+        .dshus-upd-badge:hover { color: var(--dsw-alias-brand-primary); }
       `
       document.head.appendChild(style)
       ctx.on('dispose', () => { style.remove() })
@@ -163,6 +176,58 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         { name: 'sidebar.footer.action', id: 'usage-stats' },
         (props) => React.createElement(UsageStats, props),
       ))
+
+      // ---- 检测新版：品牌行「有新版」徽章 ----
+      // 只有服务端报告 hasUpdate 才注入。品牌行外层是 <button onClick=startSession>，
+      // 锚点点击必须 stopPropagation（不 preventDefault），否则会触发新建会话。
+      const updateState = { hasUpdate: false, url: USAGE_URL }
+      let badgeAnchor = null
+      let updateTimer = null
+      let badgeObserver = null
+
+      function clearBadge() {
+        if (badgeObserver !== null) { badgeObserver.disconnect(); badgeObserver = null }
+        if (badgeAnchor && badgeAnchor.parentNode) badgeAnchor.parentNode.removeChild(badgeAnchor)
+        badgeAnchor = null
+      }
+
+      function ensureBadge() {
+        if (!updateState.hasUpdate) { clearBadge(); return }
+        if (badgeAnchor && document.body.contains(badgeAnchor)) return
+        const container = document.querySelector('[class*="brandIdentity"]')
+        if (!container || container.querySelector(`.${UPDATE_BADGE_CLASS}`)) return
+        badgeAnchor = document.createElement('a')
+        badgeAnchor.className = UPDATE_BADGE_CLASS
+        badgeAnchor.href = updateState.url
+        badgeAnchor.target = '_blank'
+        badgeAnchor.rel = 'noopener noreferrer'
+        badgeAnchor.textContent = UPDATE_BADGE_TEXT
+        badgeAnchor.addEventListener('click', (event) => { event.stopPropagation() })
+        container.appendChild(badgeAnchor)
+        if (badgeObserver === null) {
+          // React 渲染会重建品牌行 DOM，观察变化以便徽章被清掉后重新挂上
+          badgeObserver = new MutationObserver(ensureBadge)
+          badgeObserver.observe(document.body, { childList: true, subtree: true })
+        }
+      }
+
+      function pollUpdate() {
+        fetch(UPDATE_ROUTE, { headers: { Accept: 'application/json' } })
+          .then((response) => response.json())
+          .then((payload) => {
+            updateState.hasUpdate = !!(payload && typeof payload === 'object' && payload.hasUpdate === true)
+            if (payload && typeof payload === 'object' && typeof payload.url === 'string') updateState.url = payload.url
+            ensureBadge()
+          })
+          .catch(() => { updateState.hasUpdate = false; clearBadge() })
+        updateTimer = setTimeout(pollUpdate, UPDATE_POLL_MS)
+      }
+      pollUpdate()
+
+      ctx.on('dispose', () => {
+        if (updateTimer !== null) clearTimeout(updateTimer)
+        clearBadge()
+      })
     }
 
       return module.exports

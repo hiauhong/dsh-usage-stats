@@ -11,7 +11,7 @@
  */
 
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import { readdirSync, readFileSync, statSync, chmodSync } from 'node:fs'
 
 export const name = 'usage-stats'
@@ -51,7 +51,15 @@ const OFFICIAL_HEADERS = {
   'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
 }
 const QUERY_ROUTE = '/api/usage-stats/query'
+const UPDATE_ROUTE = '/api/usage-stats/update'
 const CACHE_TTL_MS = 60000
+// 版本检测（Host 侧）：读取运行中 DSH 的版本（从其 package.json），定期拉取 npm
+// 最新版，比较后决定是否在品牌行显示「有新版」。有新版才提示，无新版隐藏。
+const DSH_INSTALL_ROOT = join(dirname(process.argv[1] || ''), '..')
+const DSH_PKG_JSON = join(DSH_INSTALL_ROOT, 'package.json')
+const NPM_DIST_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh'
+const RELEASES_URL = 'https://github.com/deepseek-ai/deepseek-harness/releases'
+const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频，避免频繁打 npm
 
 function pad2(value) {
   return String(value).padStart(2, '0')
@@ -530,6 +538,105 @@ async function fetchOfficial() {
 }
 
 // ---------------------------------------------------------------------------
+// 版本检测（检测新版）
+// ---------------------------------------------------------------------------
+
+// 轻量 semver 比较（支持 -rc.N 预发布段，不引入外部依赖）：返回 a>b?1, a<b?-1, 相等 0。
+// 纯 x.y.z 视为高于同版本 x.y.z-rcN 的预发布。
+function compareVersions(a, b) {
+  const pa = parseVersion(a)
+  const pb = parseVersion(b)
+  if (pa === null || pb === null) return 0 // 无法解析则视为相等，避免误报
+  for (const key of ['major', 'minor', 'patch']) {
+    if (pa[key] !== pb[key]) return pa[key] > pb[key] ? 1 : -1
+  }
+  // 主版本段相同：有预发布段 < 正式版；再按 prerelease 逐段比较
+  if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0
+  if (pa.prerelease.length === 0) return 1
+  if (pb.prerelease.length === 0) return -1
+  const len = Math.max(pa.prerelease.length, pb.prerelease.length)
+  for (let i = 0; i < len; i++) {
+    const xa = pa.prerelease[i]
+    const xb = pb.prerelease[i]
+    if (xa === undefined) return -1
+    if (xb === undefined) return 1
+    const na = /^\d+$/.test(xa)
+    const nb = /^\d+$/.test(xb)
+    if (na && nb) {
+      if (Number(xa) !== Number(xb)) return Number(xa) > Number(xb) ? 1 : -1
+    } else if (na) {
+      // 数字标识符 < 字母标识符
+      return -1
+    } else if (nb) {
+      return 1
+    } else {
+      if (xa !== xb) return xa > xb ? 1 : -1
+    }
+  }
+  return 0
+}
+
+function parseVersion(input) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.*)?$/.exec(String(input).trim())
+  if (m === null) return null
+  const prerelease = m[4] ? m[4].split('.') : []
+  return { major: +m[1], minor: +m[2], patch: +m[3], prerelease }
+}
+
+// 读取运行中 DSH 的安装版本（与其自身 --version 同源：bin.js 旁 package.json）。
+function installedDshVersion() {
+  try {
+    const pkg = JSON.parse(readFileSync(DSH_PKG_JSON, 'utf8'))
+    return typeof pkg.version === 'string' ? pkg.version : null
+  } catch {
+    return null
+  }
+}
+
+// npm registry：@deepseek-ai/dsh 的 dist-tags.latest。（仅 GET，无副作用）
+async function fetchLatestDshVersion() {
+  const response = await fetch(NPM_DIST_URL, {
+    headers: { Accept: 'application/json', 'User-Agent': UA },
+    signal: AbortSignal.timeout(15000),
+  })
+  if (!response.ok) throw new Error(`npm registry ${response.status}`)
+  const json = await response.json()
+  const latest = json && json['dist-tags'] && json['dist-tags'].latest
+  return typeof latest === 'string' ? latest : null
+}
+
+// 版本检测缓存：TTL 1h，in-flight 合并，失败不毒化缓存（下次重试）。
+let updateCache = null
+let updateInFlight = null
+
+async function updateSnapshot() {
+  const now = Date.now()
+  if (updateCache !== null && now - updateCache.at < UPDATE_CHECK_TTL_MS) return updateCache.data
+  if (updateInFlight !== null) return updateInFlight.promise
+  const promise = (async () => {
+    try {
+      const installed = installedDshVersion()
+      const latest = await fetchLatestDshVersion()
+      const data = {
+        hasUpdate: installed !== null && latest !== null && compareVersions(latest, installed) > 0,
+        installed,
+        latest,
+        url: RELEASES_URL,
+      }
+      updateCache = { at: Date.now(), data }
+      return data
+    } catch (err) {
+      updateCache = null
+      return { hasUpdate: false, installed: installedDshVersion(), latest: null, url: RELEASES_URL, error: String(err) }
+    } finally {
+      updateInFlight = null
+    }
+  })()
+  updateInFlight = { promise }
+  return promise
+}
+
+// ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
 
@@ -689,5 +796,33 @@ export async function apply(ctx) {
         }
       },
     }), 'usage-stats: query route')
+
+    // 版本检测路由：仅供本机页面读取「是否有新版」（非敏感，但同样回环+限流）。
+    ctx.effect(() => server.register({
+      kind: 'exact',
+      path: UPDATE_ROUTE,
+      handler: async (req, res) => {
+        const send = (status, body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          res.end(JSON.stringify(body))
+        }
+        try {
+          if (req.method !== 'GET') {
+            send(405, { ok: false, error: 'method not allowed' })
+            return
+          }
+          const remote = req.socket.remoteAddress || ''
+          if (!isLoopback(remote) || rateLimited(remote)) {
+            send(403, { ok: false, error: 'forbidden' })
+            return
+          }
+          const data = await updateSnapshot()
+          send(200, { ok: true, ...data })
+        } catch (err) {
+          ctx.logger.warn(`usage-stats: update route failed: ${String(err)}`)
+          send(500, { ok: false, error: 'internal' })
+        }
+      },
+    }), 'usage-stats: update route')
   }
 }
