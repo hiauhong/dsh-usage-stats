@@ -451,7 +451,41 @@ function sumModels(modelUsages) {
   return { tokens, requests }
 }
 
-function parseOfficialPayload(amountRes, costRes, summaryRes) {
+/** 北京时间今日 00:00 的 epoch 秒。 */
+function beijingTodayStartSec() {
+  const shifted = new Date(Date.now() + BEIJING_OFFSET_MS)
+  const startMs = Date.UTC(shifted.getUTCFullYear(), shifted.getUTCMonth(), shifted.getUTCDate()) - BEIJING_OFFSET_MS
+  return Math.floor(startMs / 1000)
+}
+
+/** 对 by_api_key/amount 的 biz_data 求和 tokens/requests（小时桶，实时准确）。 */
+function sumByApiKeyAmount(biz) {
+  let tokens = 0
+  let requests = 0
+  for (const s of biz.series || []) {
+    for (const b of s.buckets || []) {
+      const u = b.usage || {}
+      tokens += (u.PROMPT_CACHE_HIT_TOKEN || 0) + (u.PROMPT_CACHE_MISS_TOKEN || 0) + (u.RESPONSE_TOKEN || 0)
+      requests += (u.REQUEST || 0)
+    }
+  }
+  return { tokens, requests }
+}
+
+/** 对 by_api_key/cost 的 biz_data 求和 cost（小时桶，实时准确）。 */
+function sumByApiKeyCost(biz) {
+  let cost = 0
+  const data0 = (biz.data && biz.data[0]) || {}
+  for (const s of data0.series || []) {
+    for (const b of s.buckets || []) {
+      const c = b.cost
+      if (c !== undefined && c !== null && c !== '' && c !== 0) cost += Number(c) || 0
+    }
+  }
+  return cost
+}
+
+function parseOfficialPayload(amountRes, costRes, summaryRes, byKeyAmount, byKeyCost) {
   const amountBiz = amountRes && amountRes.data && amountRes.data.biz_data
   const costBiz = costRes && costRes.data && costRes.data.biz_data
   if (!amountBiz) throw new Error('amount payload missing biz_data')
@@ -475,10 +509,20 @@ function parseOfficialPayload(amountRes, costRes, summaryRes) {
     costDayMap.set(day.date, s)
     monthCost += s.tokens
   }
-  const todayKey = beijingDayKey(Date.now())
-  // 今日缺失时显示 0，绝不把返回数据的最后一天冒充"今日"
-  const todayAmount = dayMap.get(todayKey) || { tokens: 0, requests: 0 }
-  const todayCost = costDayMap.get(todayKey) || { tokens: 0, requests: 0 }
+
+  // 今日真实用量：by_api_key 按小时（实时准确）。按天接口今日滞后=0，故用 by_api_key 覆盖今日，
+  // 本月仍用按天接口值（官方「本月」口径，今天按 0 滞后计，不重复叠加今日）。
+  let liveTodayTokens = 0
+  let liveTodayRequests = 0
+  let liveTodayCost = 0
+  const keyAmountBiz = byKeyAmount && byKeyAmount.data && byKeyAmount.data.biz_data
+  if (keyAmountBiz) {
+    const s = sumByApiKeyAmount(keyAmountBiz)
+    liveTodayTokens = s.tokens
+    liveTodayRequests = s.requests
+  }
+  const keyCostBiz = byKeyCost && byKeyCost.data && byKeyCost.data.biz_data
+  if (keyCostBiz) liveTodayCost = sumByApiKeyCost(keyCostBiz)
 
   let balance = null
   const biz = summaryRes && summaryRes.data && summaryRes.data.biz_data
@@ -494,7 +538,8 @@ function parseOfficialPayload(amountRes, costRes, summaryRes) {
   }
 
   return {
-    today: { tokens: todayAmount.tokens, cost: todayCost.tokens },
+    today: { tokens: liveTodayTokens, cost: liveTodayCost, requests: liveTodayRequests },
+    // 本月用按天接口值（官方页「本月」口径，今天按 0 滞后计）。不要把今日再叠加进本月——会重复。
     month: { tokens: monthTokens, cost: monthCost, requests: monthRequests },
     currency,
     balance,
@@ -509,6 +554,9 @@ async function fetchOfficial() {
   const month = shifted.getUTCMonth() + 1
   const year = shifted.getUTCFullYear()
   const query = `?month=${month}&year=${year}`
+  // 今日窗口（北京时间 00:00 → 次日 00:00），by_api_key 按小时、实时
+  const today0 = beijingTodayStartSec()
+  const byKeyWindow = `?start=${today0}&end=${today0 + 86400}&tz=${BEIJING_OFFSET_MS / 1000}`
 
   const fetchBatch = (t) => {
     const signal = AbortSignal.timeout(15000)
@@ -519,10 +567,12 @@ async function fetchOfficial() {
       wrap(fetchJson(`/api/v0/usage/amount${query}`, t, signal)),
       wrap(fetchJson(`/api/v0/usage/cost${query}`, t, signal)),
       wrap(fetchJson('/api/v0/users/get_user_summary', t, signal)),
+      wrap(fetchJson(`/api/v0/usage/by_api_key/amount${byKeyWindow}`, t, signal)),
+      wrap(fetchJson(`/api/v0/usage/by_api_key/cost${byKeyWindow}`, t, signal)),
     ])
   }
 
-  let [amountRes, costRes, summaryRes] = await fetchBatch(token)
+  let [amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(token)
   if (isAuthError(amountRes) || isAuthError(costRes) || isAuthError(summaryRes)) {
     // token 失效：全部失效 + 强制重扫（配置重读 + 浏览器重扫），用新 token 重试一次
     tokenState.manual = null
@@ -532,9 +582,9 @@ async function fetchOfficial() {
     tokenState.scanCheckedAt = 0
     const retried = await resolveToken(true)
     if (retried === null) throw new Error('platform token invalid and no fresh candidate')
-    ;[amountRes, costRes, summaryRes] = await fetchBatch(retried)
+    ;[amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(retried)
   }
-  return parseOfficialPayload(amountRes, costRes, summaryRes)
+  return parseOfficialPayload(amountRes, costRes, summaryRes, byKeyAmount, byKeyCost)
 }
 
 // ---------------------------------------------------------------------------
@@ -775,7 +825,7 @@ export async function apply(ctx) {
           if (official !== null) {
             // 保留接口原始货币与金额，不做硬编码汇率换算
             payload.source = 'official'
-            payload.today = { tokens: official.today.tokens, cost: official.today.cost, calls: 0 }
+            payload.today = { tokens: official.today.tokens, cost: official.today.cost, calls: official.today.requests }
             payload.month = { tokens: official.month.tokens, cost: official.month.cost, calls: official.month.requests }
             payload.currency = official.currency
             payload.balance = official.balance
