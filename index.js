@@ -12,7 +12,7 @@
 
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { readdirSync, readFileSync, statSync, chmodSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, chmodSync, realpathSync } from 'node:fs'
 
 export const name = 'usage-stats'
 export const inject = ['webServer']
@@ -55,7 +55,17 @@ const UPDATE_ROUTE = '/api/usage-stats/update'
 const CACHE_TTL_MS = 60000
 // 版本检测（Host 侧）：读取运行中 DSH 的版本（从其 package.json），定期拉取 npm
 // 最新版，比较后决定是否在品牌行显示「有新版」。有新版才提示，无新版隐藏。
-const DSH_INSTALL_ROOT = join(dirname(process.argv[1] || ''), '..')
+// 运行中 DSH 的安装根目录：realpath 解掉 bin/dsh 符号链接，避免 dirname(argv[1])/..
+// 落到 nvm 根目录（无 package.json）。解不开则退回字面路径。
+function resolveDshInstallRoot() {
+  const literal = process.argv[1] || ''
+  try {
+    return join(dirname(realpathSync(literal)), '..')
+  } catch {
+    return join(dirname(literal), '..')
+  }
+}
+const DSH_INSTALL_ROOT = resolveDshInstallRoot()
 const DSH_PKG_JSON = join(DSH_INSTALL_ROOT, 'package.json')
 const NPM_DIST_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh'
 const RELEASES_URL = 'https://github.com/deepseek-ai/deepseek-harness/releases'
