@@ -19,9 +19,9 @@ dsh plugin --profile web add ./dsh-usage-stats   # 或发布后: github:<owner>/
 
 安装后重启 `dsh web`。
 
-## 配置 token（可选）
+## 配置 token
 
-不配置也能用（此时显示 DSH 本地用量估算）。要显示**官方精确数据与余额**，
+插件只使用**官方用量、费用与余额**，需要有效的 token。
 创建 `~/.dsh/dsh-usage-stats.json`：
 
 ```json
@@ -73,9 +73,11 @@ autoScan 会读取各浏览器 profile 的 `Local Storage/leveldb`，启发式�
 
 ## 数据来源
 
-- **官方口径**（配置 token 后）：与 platform.deepseek.com/usage 页面一致，
+- **唯一数据源为官方平台**（配置有效 token 后）：
   为账号全量数据（含其他客户端用量）
-- **本地口径**（兜底）：只统计 DSH 自己花掉的用量，费用为估算
+- 不监听本地请求、不统计会话、不维护价格表，也不显示本地计算的峰谷价格档位。
+- 未配置或 token 无效时显示配置提示；官方请求失败时显示暂不可用，不以零用量替代。
+- 今日使用官方小时桶，本月使用官方日桶，两者可能有不同的更新延迟。
 - 卡片显示「官方」徽标表示当前是官方数据
 
 ## 卸载
@@ -86,5 +88,5 @@ dsh plugin --profile web remove dsh-usage-stats
 
 ## License / 致谢
 
-MIT（见 [LICENSE](LICENSE)）；架构参考 [dsh-liquid-glass-balance-card](https://github.com/SoDaZilla-zzz/dsh-liquid-glass-balance-card)、
-折叠逻辑改编自 [dsh-token-stats](https://github.com/F1shn/dsh-token-stats)（均为 MIT）。
+MIT（见 [LICENSE](LICENSE)）；架构参考 [dsh-liquid-glass-balance-card](https://github.com/SoDaZilla-zzz/dsh-liquid-glass-balance-card)。
+早期本地统计逻辑曾参考 [dsh-token-stats](https://github.com/F1shn/dsh-token-stats)（MIT），现已移除。

@@ -36,16 +36,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       return `余额 ${symbol}${truncate2(amount).toFixed(2)}`
     }
 
-    // 当前价格档位（与官方一致：工作日北京 9-12、14-18 为高峰，其余空闲；高峰价=2×空闲；
-    // 2026-08-23 起周末全天不再区分峰谷，统一按空闲（低谷）价）
-    function pricingTier() {
-      const now = new Date(Date.now() + 8 * 60 * 60 * 1000)
-      const h = now.getUTCHours()
-      const day = now.getUTCDay() // 0=周日, 6=周六
-      if (day === 0 || day === 6) return '空闲'
-      return (h >= 9 && h < 12) || (h >= 14 && h < 18) ? '高峰' : '空闲'
-    }
-
     module.exports.inject = ['slots']
 
     module.exports.apply = function apply(ctx) {
@@ -112,14 +102,20 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           let timer = null
           const load = () => {
             fetch(QUERY_ROUTE, { headers: { Accept: 'application/json' } })
-              .then((response) => response.json())
+              .then((response) => {
+                if (!response.ok) throw new Error('usage unavailable')
+                return response.json()
+              })
               .then((payload) => {
                 if (!alive) return
-                if (payload !== null && typeof payload === 'object' && payload.today !== undefined) {
-                  setData(payload)
+                if (!payload || !['ready', 'unavailable', 'configuration_required'].includes(payload.status)) {
+                  throw new Error('invalid usage response')
                 }
+                setData(payload)
               })
-              .catch(() => {})
+              .catch(() => {
+                if (alive) setData({ status: 'unavailable', officialError: '官方数据暂不可用，请稍后重试' })
+              })
             timer = setTimeout(load, REFRESH_MS)
           }
           load()
@@ -136,13 +132,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           },
             React.createElement('span', { className: 'dshus-title' }, '用量信息'),
             React.createElement('span', { className: 'dshus-link' }, '↗'),
-            data !== null && data.source === 'official'
+            data !== null && data.status === 'ready'
               ? React.createElement('span', { className: 'dshus-badge' }, '官方')
-              : data !== null && data.source === 'local'
-                ? React.createElement('span', { className: 'dshus-badge' }, '估算')
-                : null,
-            data !== null
-              ? React.createElement('span', { className: 'dshus-badge' }, pricingTier())
               : null),
           data !== null && data.balance !== null && data.balance !== undefined
             ? React.createElement('span', { className: 'dshus-balance' }, formatBalance(data.balance.amount, data.balance.currency))
@@ -151,6 +142,14 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         if (data === null) {
           return React.createElement('div', { className: 'dshus-block' }, head,
             React.createElement('div', { className: 'dshus-loading' }, '统计中…'))
+        }
+
+        if (data.status !== 'ready') {
+          const message = data.scanHint || data.officialError || '官方数据暂不可用'
+          return wide
+            ? React.createElement('div', { className: 'dshus-block' }, head,
+                React.createElement('div', { className: 'dshus-loading' }, message))
+            : React.createElement('div', { className: 'dshus-rail', title: message }, 'Σ —')
         }
 
         const todayLine = React.createElement('div', { className: 'dshus-row' },

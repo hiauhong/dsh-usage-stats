@@ -3,11 +3,8 @@
  *
  * 数据通道：注册本地 HTTP 路由 `/api/usage-stats/query`，浏览器客户端同源
  * fetch（无 CORS 问题）。Host 负责：
- *   1. 本地统计：回放会话日志 + 挂 llm/stream 实时累加（DSH 自己的用量，token 与
- *      官方同源，费用按 DeepSeek 官方人民币价估算）
- *   2. 官方数据（可选）：platform userToken → 平台私有端点（余额 / 用量 / 费用），
- *      与 platform.deepseek.com/usage 页面一致（账号全量口径）
- * 官方不可用时自动回退本地统计。
+ *   官方数据：platform userToken → 平台私有端点（余额 / 用量 / 费用）。
+ *   官方不可用时返回明确状态，不估算用量或费用。
  */
 
 import { homedir } from 'node:os'
@@ -18,27 +15,6 @@ export const name = 'usage-stats'
 export const inject = ['webServer']
 
 const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
-const NEW_PRICING_AT = Date.parse('2026-08-17T00:00:00+08:00')
-// 2026-08-23 起周末（周六/周日）全天不再区分峰谷，统一按低谷（空闲）价计费
-const WEEKEND_PRICING_AT = Date.parse('2026-08-23T00:00:00+08:00')
-const MAX_DAY_BUCKETS = 370
-const OFFICIAL_PROVIDERS = new Set(['deepseek-official', 'session-title-first-prompt-llm'])
-
-const PRICES = {
-  'deepseek-v4-flash': { cacheHit: 0.05, cacheMiss: 1.5, output: 4.5 },
-  'deepseek-v4-pro': { cacheHit: 0.15, cacheMiss: 4.5, output: 13.5 },
-}
-const LEGACY_PRICES = {
-  'deepseek-v4-flash': { cacheHit: 0.02, cacheMiss: 1, output: 2 },
-  'deepseek-v4-pro': { cacheHit: 0.025, cacheMiss: 3, output: 6 },
-}
-const MODEL_ALIASES = {
-  'deepseek-v4-flash': 'deepseek-v4-flash',
-  'deepseek-v4-flash-0731': 'deepseek-v4-flash',
-  'deepseek-v4-pro': 'deepseek-v4-pro',
-  'deepseek-v4-pro-0813': 'deepseek-v4-pro',
-}
-
 const TOKEN_FILE = join(homedir(), '.dsh', 'dsh-usage-stats.json')
 const PLATFORM_BASE = 'https://platform.deepseek.com'
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
@@ -70,116 +46,6 @@ const DSH_PKG_JSON = join(DSH_INSTALL_ROOT, 'package.json')
 const NPM_DIST_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh'
 const RELEASES_URL = 'https://github.com/deepseek-ai/deepseek-harness/releases'
 const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频，避免频繁打 npm
-
-function pad2(value) {
-  return String(value).padStart(2, '0')
-}
-
-function beijingDayKey(time) {
-  const d = new Date(time + BEIJING_OFFSET_MS)
-  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`
-}
-
-function peakMultiplier(time) {
-  if (time < NEW_PRICING_AT) return 1
-  const d = new Date(time + BEIJING_OFFSET_MS)
-  const h = d.getUTCHours()
-  // 2026-08-23 起：周末全天低谷价（高峰倍率 1）；工作日维持 9-12、14-18 高峰×2
-  if (time >= WEEKEND_PRICING_AT) {
-    const day = d.getUTCDay() // 0=周日, 6=周六
-    if (day === 0 || day === 6) return 1
-  }
-  return (h >= 9 && h < 12) || (h >= 14 && h < 18) ? 2 : 1
-}
-
-function zeroRow() {
-  return {
-    calls: 0,
-    inputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-    outputTokens: 0,
-    costCny: 0,
-  }
-}
-
-const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0)
-const resolveModel = (provider, model) => (OFFICIAL_PROVIDERS.has(provider) ? MODEL_ALIASES[model] : undefined)
-
-// ---------------------------------------------------------------------------
-// 本地统计：实时（llm/stream 累加，轻量；官方数据为准，本地仅兜底）
-// ---------------------------------------------------------------------------
-
-function applyUsage(days, provider, model, usage, time) {
-  if (typeof time !== 'number' || !Number.isFinite(time)) return
-  const alias = resolveModel(provider, model)
-  if (alias === undefined || typeof usage !== 'object' || usage === null) return
-  const b = {
-    inputTokens: num(usage.inputTokens),
-    cacheReadTokens: num(usage.cacheReadTokens),
-    cacheWriteTokens: num(usage.cacheWriteTokens),
-    outputTokens: num(usage.outputTokens),
-  }
-  const table = time < NEW_PRICING_AT ? LEGACY_PRICES : PRICES
-  const price = table[alias]
-  if (price === undefined) return
-  const miss = b.inputTokens + b.cacheWriteTokens
-  const cost = (miss * price.cacheMiss + b.cacheReadTokens * price.cacheHit + b.outputTokens * price.output) * peakMultiplier(time) / 1_000_000
-  const key = beijingDayKey(time)
-  const prev = days[key] || zeroRow()
-  days[key] = {
-    calls: prev.calls + 1,
-    inputTokens: prev.inputTokens + b.inputTokens,
-    cacheReadTokens: prev.cacheReadTokens + b.cacheReadTokens,
-    cacheWriteTokens: prev.cacheWriteTokens + b.cacheWriteTokens,
-    outputTokens: prev.outputTokens + b.outputTokens,
-    costCny: prev.costCny + cost,
-  }
-  const keys = Object.keys(days)
-  if (keys.length > MAX_DAY_BUCKETS) {
-    keys.sort().slice(0, keys.length - MAX_DAY_BUCKETS).forEach((k) => { delete days[k] })
-  }
-}
-
-/** 把 source 日桶按日键累加进 target。 */
-function mergeDays(target, source) {
-  for (const [key, row] of Object.entries(source)) {
-    const prev = target[key] || zeroRow()
-    target[key] = {
-      calls: prev.calls + row.calls,
-      inputTokens: prev.inputTokens + row.inputTokens,
-      cacheReadTokens: prev.cacheReadTokens + row.cacheReadTokens,
-      cacheWriteTokens: prev.cacheWriteTokens + row.cacheWriteTokens,
-      outputTokens: prev.outputTokens + row.outputTokens,
-      costCny: prev.costCny + row.costCny,
-    }
-  }
-}
-
-function localPeriods(days, now) {
-  const todayKey = beijingDayKey(now)
-  const monthPrefix = todayKey.slice(0, 7)
-  const toJson = (row) => ({
-    tokens: row.inputTokens + row.cacheReadTokens + row.cacheWriteTokens + row.outputTokens,
-    cost: row.costCny,
-    calls: row.calls,
-  })
-  let month = zeroRow()
-  for (const key of Object.keys(days)) {
-    if (key.startsWith(monthPrefix)) {
-      const row = days[key]
-      month = {
-        calls: month.calls + row.calls,
-        inputTokens: month.inputTokens + row.inputTokens,
-        cacheReadTokens: month.cacheReadTokens + row.cacheReadTokens,
-        cacheWriteTokens: month.cacheWriteTokens + row.cacheWriteTokens,
-        outputTokens: month.outputTokens + row.outputTokens,
-        costCny: month.costCny + row.costCny,
-      }
-    }
-  }
-  return { today: toJson(days[todayKey] || zeroRow()), month: toJson(month), todayKey }
-}
 
 // ---------------------------------------------------------------------------
 // 官方端点（platform userToken → 私有 dashboard 接口）
@@ -498,7 +364,11 @@ function sumByApiKeyCost(biz) {
 function parseOfficialPayload(amountRes, costRes, summaryRes, byKeyAmount, byKeyCost) {
   const amountBiz = amountRes && amountRes.data && amountRes.data.biz_data
   const costBiz = costRes && costRes.data && costRes.data.biz_data
-  if (!amountBiz) throw new Error('amount payload missing biz_data')
+  for (const result of [amountRes, costRes, byKeyAmount, byKeyCost]) {
+    if (result?.code !== 0 || !result?.data?.biz_data || isAuthError(result)) {
+      throw new Error('official usage data unavailable')
+    }
+  }
   const currency = (costBiz && costBiz[0] && costBiz[0].currency) || 'CNY'
 
   const dayMap = new Map()
@@ -583,7 +453,7 @@ async function fetchOfficial() {
   }
 
   let [amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(token)
-  if (isAuthError(amountRes) || isAuthError(costRes) || isAuthError(summaryRes)) {
+  if ([amountRes, costRes, summaryRes, byKeyAmount, byKeyCost].some(isAuthError)) {
     // token 失效：全部失效 + 强制重扫（配置重读 + 浏览器重扫），用新 token 重试一次
     tokenState.manual = null
     tokenState.manualValid = false
@@ -701,36 +571,9 @@ async function updateSnapshot() {
 // ---------------------------------------------------------------------------
 
 export async function apply(ctx) {
-  // 本地估算：只用实时 llm/stream 累加（轻量）。以官方数据为准，本地仅兜底。
-  // 不再做会话回放/尾扫 —— 那会周期性同步读+解析会话日志，偶发卡住事件循环。
-  const watermark = Date.now()
-
-  // ---- 实时流（立即接入，只统计水印后开始的请求） ----
-  const daysLive = {}
-  ctx.on('llm/stream', (options, next) => {
-    const provider = options.provider
-    const model = options.model
-    const startedAt = Date.now()
-    const stream = next()
-    return (async function* () {
-      for await (const chunk of stream) {
-        if (chunk.type === 'usage' && startedAt >= watermark) applyUsage(daysLive, provider, model, chunk.usage, startedAt)
-        yield chunk
-      }
-    })()
-  })
-
-  // 合并视图：本地估算只用实时累加的日桶（复制一份，避免外部误改 live 桶）
-  const mergedDays = () => {
-    const d = {}
-    mergeDays(d, daysLive)
-    return d
-  }
-
   // 官方数据缓存 + in-flight 合并 + 配置变更失效。
   // balance 缺失（get_user_summary 偶发失败）时用短 TTL，快速重试而非毒化缓存。
   let officialCache = null
-  let lastOfficialError = null
   let officialInFlight = null
   const BALANCE_WEAK_TTL_MS = 10_000
 
@@ -766,10 +609,8 @@ export async function apply(ctx) {
           ctx.logger.warn('usage-stats: balance unavailable (get_user_summary failed); will retry shortly')
         }
         officialCache = { at: Date.now(), data, generation: gen, weak: data.balance === null }
-        lastOfficialError = null
         return data
       } catch (err) {
-        lastOfficialError = String(err)
         officialCache = null
         return null
       } finally {
@@ -821,26 +662,28 @@ export async function apply(ctx) {
             return
           }
           const now = Date.now()
-          const local = localPeriods(mergedDays(), now)
           const payload = {
-            source: 'local',
-            today: local.today,
-            month: local.month,
-            todayKey: local.todayKey,
-            currency: 'CNY',
+            source: 'official',
+            status: 'unavailable',
+            today: null,
+            month: null,
+            currency: null,
             balance: null,
             generatedAt: now,
           }
           const official = await officialSnapshot()
           if (official !== null) {
             // 保留接口原始货币与金额，不做硬编码汇率换算
-            payload.source = 'official'
+            payload.status = 'ready'
             payload.today = { tokens: official.today.tokens, cost: official.today.cost, calls: official.today.requests }
             payload.month = { tokens: official.month.tokens, cost: official.month.cost, calls: official.month.requests }
             payload.currency = official.currency
             payload.balance = official.balance
           } else {
-            payload.officialError = '官方数据暂不可用'
+            payload.status = tokenState.manual === null && !tokenState.autoScan ? 'configuration_required' : 'unavailable'
+            payload.officialError = payload.status === 'configuration_required'
+              ? '请配置有效的 platformToken 以查看官方用量'
+              : '官方数据暂不可用，请稍后重试'
             // P2-4：autoScan 开着却拿不到有效 token 时，明确提示（避免默默兜底让人困惑）
             if (tokenState.autoScan) {
               payload.scanHint = tokenState.candidates.length === 0
