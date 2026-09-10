@@ -36,6 +36,15 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       return `余额 ${symbol}${truncate2(amount).toFixed(2)}`
     }
 
+    // 恢复原有北京时间时段提示；仅用于展示，不参与 token 或费用计算。
+    function pricingTier() {
+      const now = new Date(Date.now() + 8 * 60 * 60 * 1000)
+      const h = now.getUTCHours()
+      const day = now.getUTCDay()
+      if (day === 0 || day === 6) return '空闲'
+      return (h >= 9 && h < 12) || (h >= 14 && h < 18) ? '高峰' : '空闲'
+    }
+
     module.exports.inject = ['slots']
 
     module.exports.apply = function apply(ctx) {
@@ -132,8 +141,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           },
             React.createElement('span', { className: 'dshus-title' }, '用量信息'),
             React.createElement('span', { className: 'dshus-link' }, '↗'),
-            data !== null && data.status === 'ready'
-              ? React.createElement('span', { className: 'dshus-badge' }, '官方')
+            data !== null
+              ? React.createElement('span', { className: 'dshus-badge' }, pricingTier())
               : null),
           data !== null && data.balance !== null && data.balance !== undefined
             ? React.createElement('span', { className: 'dshus-balance' }, formatBalance(data.balance.amount, data.balance.currency))
