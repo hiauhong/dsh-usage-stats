@@ -9,7 +9,7 @@ DeepSeek Harness 插件：侧边栏左下角（设置按钮上方）显示**今�
 点击卡片标题「用量信息↗」可打开 DeepSeek 开放平台，查看官方详细用量数据。
 点击「有新版」徽章可打开 [deepseek-harness Releases](https://github.com/deepseek-ai/deepseek-harness/releases)。
 
-> 🎨 **Vibe coding 项目**：功能、测试与文档由 AI agent 协作产出（vibe coding），**未经人工逐行审查，请谨慎用于生产环境**。
+> 🤖 **Vibe coding 项目**：功能、测试与文档由 AI agent 协作产出（vibe coding），**未经人工逐行审查，请谨慎用于生产环境**。
 
 ## 效果预览
 
