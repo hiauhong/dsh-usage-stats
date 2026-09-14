@@ -1,11 +1,15 @@
 # dsh-usage-stats
 
+[![Vibe coded](https://img.shields.io/badge/vibe-coded-%23ff69b4?style=flat-square)](https://en.wikipedia.org/wiki/Vibe_coding)
+
 DeepSeek Harness 插件：侧边栏左下角（设置按钮上方）显示**今日 / 本月** token
 消耗、费用与**账户余额**；并在左上角品牌行（`deepseek HARNESS` 右侧）检测
 **是否有新版** DSH，有则显示「有新版」徽章。
 
 点击卡片标题「用量信息↗」可打开 DeepSeek 开放平台，查看官方详细用量数据。
 点击「有新版」徽章可打开 [deepseek-harness Releases](https://github.com/deepseek-ai/deepseek-harness/releases)。
+
+> 🎨 本项目由 **vibe coding**(AI 辅助开发)驱动——功能、测试与文档均在 AI agent 协作下迭代产出。
 
 ## 效果预览
 
