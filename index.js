@@ -28,7 +28,16 @@ const OFFICIAL_HEADERS = {
 }
 const QUERY_ROUTE = '/api/usage-stats/query'
 const UPDATE_ROUTE = '/api/usage-stats/update'
+const STATUS_ROUTE = '/api/usage-stats/status'
 const CACHE_TTL_MS = 60000
+// 服务状态（status.deepseek.com）：官方状态站是 FlashDuty 托管的 JS 页面，HTML 里
+// 只有标题，Statuspage 式 /api/v2/* 返回 404 —— 能用的机器接口只有 RSS。
+// 故障更新本来就是分钟级，5 分钟一轮足够，并做 in-flight 合并。
+const STATUS_FEED_URL = 'https://status.deepseek.com/history.rss'
+const STATUS_PAGE_URL = 'https://status.deepseek.com'
+const STATUS_CHECK_TTL_MS = 5 * 60 * 1000
+// 僵尸保护：RSS 卡住或某条一直没写 resolved 时，不要把陈年条目永远挂在界面上
+const STATUS_MAX_AGE_MS = 12 * 60 * 60 * 1000
 // 版本检测（Host 侧）：读取运行中 DSH 的版本（从其 package.json），定期拉取 npm
 // 最新版，比较后决定是否在品牌行显示「有新版」。有新版才提示，无新版隐藏。
 // 运行中 DSH 的安装根目录：realpath 解掉 bin/dsh 符号链接，避免 dirname(argv[1])/..
@@ -567,6 +576,139 @@ async function updateSnapshot() {
 }
 
 // ---------------------------------------------------------------------------
+// DeepSeek 服务状态（status.deepseek.com）
+// ---------------------------------------------------------------------------
+// 每条 item 的 description 是转义过的 HTML，里面带
+//   <strong>Status:</strong> resolved|investigating|...
+//   <strong>Affected components:</strong> <组件列表>
+// 所以「进行中」= 最新一条 item 的状态不是 resolved。
+// 注意：RSS 是否收录「进行中」的条目，只能等一次真实故障再验证；若它其实只发
+// 已恢复的历史，换源即可（下面的判定逻辑不用动）。
+// 另：只有组件名带 "API" 的才算与 DSH 有关——搜索/上传/对话等服务异常不打扰用户。
+
+const XML_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }
+
+function decodeXml(text) {
+  return String(text)
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)))
+    .replace(/&([a-z]+);/gi, (match, name) => (name.toLowerCase() in XML_ENTITIES ? XML_ENTITIES[name.toLowerCase()] : match))
+}
+
+function tagText(block, tag) {
+  const m = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'i').exec(block)
+  if (m === null) return ''
+  return decodeXml(m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')).trim()
+}
+
+function isApiRelevantComponent(components) {
+  return String(components).split(',').some((part) => /API/i.test(part))
+}
+
+// 「DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）」→「API 性能下降」
+// 侧边栏只有 236px，完整官方标题放不下；完整标题进 tooltip。
+function shortStatusLabel(title) {
+  const short = String(title)
+    .split(/[（(]/)[0]
+    .trim()
+    .replace(/^DeepSeek\s*/, '')
+    .replace(/^网页\//, '')
+    .trim()
+  return short === '' ? '服务异常' : short
+}
+
+// 状态站没有单独的 severity 字段，从标题判断：中断/不可用 → 红，其余（性能下降等）→ 琥珀
+function statusSeverity(title) {
+  return /中断|不可用|unavailable|outage|down/i.test(String(title)) ? 'error' : 'warn'
+}
+
+function beijingHm(date) {
+  const t = new Date(date.getTime() + BEIJING_OFFSET_MS)
+  return `${String(t.getUTCHours()).padStart(2, '0')}:${String(t.getUTCMinutes()).padStart(2, '0')}`
+}
+
+// feed 按时间倒序，取最新一条。没有可用条目时返回 null（调用方按「问不到」处理）。
+function parseStatusFeed(xml) {
+  const items = [...String(xml).matchAll(/<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi)].map((m) => m[1])
+  if (items.length === 0) return null
+  const block = items[0]
+  const description = tagText(block, 'description')
+  const statusMatch = /Status:\s*<\/strong>\s*([^<]*)/i.exec(description) ?? /Status:\s*([^\n<]*)/i.exec(description)
+  const componentsMatch = /Affected components:\s*<\/strong>\s*([^<]*)/i.exec(description)
+  const at = new Date(tagText(block, 'pubDate'))
+  return {
+    title: tagText(block, 'title'),
+    link: tagText(block, 'link'),
+    status: statusMatch === null ? '' : statusMatch[1].trim(),
+    components: componentsMatch === null ? '' : componentsMatch[1].trim(),
+    at: Number.isNaN(at.getTime()) ? null : at,
+  }
+}
+
+// 判定「最新一条 item 算不算对用户有影响」——纯函数，便于对着真实 feed 校验。
+// 三个条件缺一不可：进行中（未 resolved）、够新（防僵尸）、组件与 API 有关。
+function evaluateStatusItem(item, now) {
+  if (item === null) return idleStatus()
+  const ongoing = item.status !== '' && !/^resolved$/i.test(item.status)
+  const fresh = item.at !== null && now - item.at.getTime() < STATUS_MAX_AGE_MS
+  if (!ongoing || !fresh || !isApiRelevantComponent(item.components)) return idleStatus()
+  return {
+    active: true,
+    severity: statusSeverity(item.title),
+    label: shortStatusLabel(item.title),
+    title: item.title,
+    components: item.components,
+    since: item.at === null ? null : beijingHm(item.at),
+    url: item.link === '' ? STATUS_PAGE_URL : item.link,
+    updatedAt: now,
+  }
+}
+
+// 状态快照：TTL 5 分钟 + in-flight 合并；失败不缓存（问不到 ≠ 出问题，下次轮询重试）。
+let statusCache = null
+let statusInFlight = null
+
+function idleStatus() {
+  return {
+    active: false,
+    severity: null,
+    label: null,
+    title: null,
+    components: null,
+    since: null,
+    url: STATUS_PAGE_URL,
+    updatedAt: Date.now(),
+  }
+}
+
+async function statusSnapshot() {
+  const now = Date.now()
+  if (statusCache !== null && now - statusCache.at < STATUS_CHECK_TTL_MS) return statusCache.data
+  if (statusInFlight !== null) return statusInFlight
+  const promise = (async () => {
+    try {
+      const response = await fetch(STATUS_FEED_URL, {
+        headers: { Accept: 'application/rss+xml, application/xml;q=0.9, */*;q=0.8', 'User-Agent': UA },
+        signal: AbortSignal.timeout(15000),
+      })
+      if (!response.ok) throw new Error(`status feed ${response.status}`)
+      const item = parseStatusFeed(await response.text())
+      if (item === null) throw new Error('status feed: no items')
+      const data = evaluateStatusItem(item, Date.now())
+      statusCache = { at: Date.now(), data }
+      return data
+    } catch {
+      statusCache = null
+      return idleStatus()
+    } finally {
+      statusInFlight = null
+    }
+  })()
+  statusInFlight = promise
+  return promise
+}
+
+// ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
 
@@ -727,5 +869,36 @@ export async function apply(ctx) {
         }
       },
     }), 'usage-stats: update route')
+
+    // 服务状态路由：同样回环 + 限流。抓取在 Host 做——status.deepseek.com 无 CORS
+    // 头，浏览器端直接 fetch 拿不到；Host 侧结果 5 分钟缓存，客户端 5 分钟轮询。
+    ctx.effect(() => server.register({
+      kind: 'exact',
+      path: STATUS_ROUTE,
+      handler: async (req, res) => {
+        const send = (status, body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          res.end(JSON.stringify(body))
+        }
+        try {
+          if (req.method !== 'GET') {
+            send(405, { ok: false, error: 'method not allowed' })
+            return
+          }
+          const remote = req.socket.remoteAddress || ''
+          if (!isLoopback(remote) || rateLimited(remote)) {
+            send(403, { ok: false, error: 'forbidden' })
+            return
+          }
+          send(200, await statusSnapshot())
+        } catch (err) {
+          ctx.logger.warn(`usage-stats: status route failed: ${String(err)}`)
+          send(500, { ok: false, error: 'internal' })
+        }
+      },
+    }), 'usage-stats: status route')
   }
 }
+
+// 仅供本地校验解析逻辑（判据来自真实 feed 的真实形状）
+export const __test = { parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml }

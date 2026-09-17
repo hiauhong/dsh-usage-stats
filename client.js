@@ -9,8 +9,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
     const USAGE_URL = 'https://platform.deepseek.com/usage'
     const QUERY_ROUTE = '/api/usage-stats/query'
     const UPDATE_ROUTE = '/api/usage-stats/update'
+    const STATUS_ROUTE = '/api/usage-stats/status'
     const REFRESH_MS = 60000
     const UPDATE_POLL_MS = 3600 * 1000 // 版本检测低频：1 小时一轮
+    const STATUS_POLL_MS = 5 * 60 * 1000 // 服务状态更新是分钟级：5 分钟一轮
     const UPDATE_BADGE_TEXT = '有新版'
     const UPDATE_BADGE_CLASS = 'dshus-upd-badge'
 
@@ -51,6 +53,26 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       const style = document.createElement('style')
       style.textContent = `
         [class*="footerActions"] { flex-wrap: wrap; }
+        .dshus-wrap { display: flex; flex-direction: column; flex: 0 0 100%; min-width: 0; }
+        /* 服务状态提示：与卡片同宽（同一个 12px 内边距）→ 文字与「用量信息」对齐。
+           形态见 backlog/specs/服务状态提示.md（原型定稿的变体 A）。 */
+        .dshus-hint {
+          display: flex; align-items: center; gap: 5px; min-width: 0;
+          margin: 0 0 3px; padding: 3px var(--dsh-sidebar-inline-padding);
+          border-radius: 4px; font-size: 11px; line-height: 1.4; text-decoration: none;
+          white-space: nowrap; overflow: hidden;
+        }
+        .dshus-hint-icon { flex: none; font-size: 10px; }
+        .dshus-hint-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+        .dshus-hint-arrow { flex: none; opacity: .8; }
+        .dshus-hint-warn { color: var(--dsw-alias-state-warn-label); background: var(--dsw-alias-state-warn-tertiary); }
+        /* 主题里没有 error 版的 tertiary，用状态色自己调一层 wash（不支持 color-mix 时
+           退回官方的 danger hover 底色，只是更淡） */
+        .dshus-hint-error {
+          color: var(--dsw-alias-state-error-primary);
+          background: var(--dsw-alias-interactive-bg-hover-danger);
+          background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent);
+        }
         .dshus-block {
           display: flex; flex-direction: column; gap: 3px; flex: 0 0 100%;
           min-width: 0; padding: 7px var(--dsh-sidebar-inline-padding); box-sizing: border-box;
@@ -87,7 +109,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         .dshus-rail {
           display: flex; align-items: center; justify-content: center; padding: 6px 0;
           font-size: 10px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary);
+          text-decoration: none;
         }
+        /* 收起态有故障：整项从 Σ 摘要换成图标（tooltip 带完整文案） */
+        .dshus-rail-alert { border-radius: 4px; padding: 4px 0; font-size: 12px; }
         .dshus-loading { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
         .dshus-upd-badge {
           flex: none; align-self: center;
@@ -131,6 +156,54 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           return () => { alive = false; if (timer !== null) clearTimeout(timer) }
         }, [])
 
+        // 服务状态：只在「有影响」时出现。拉不到就按「没问题」处理（问不到 ≠ 出问题）。
+        const [alert, setAlert] = React.useState(null)
+        React.useEffect(() => {
+          let alive = true
+          let timer = null
+          const load = () => {
+            fetch(STATUS_ROUTE, { headers: { Accept: 'application/json' } })
+              .then((response) => (response.ok ? response.json() : null))
+              .then((payload) => {
+                if (!alive) return
+                setAlert(payload !== null && typeof payload === 'object' && payload.active === true ? payload : null)
+              })
+              .catch(() => { if (alive) setAlert(null) })
+            timer = setTimeout(load, STATUS_POLL_MS)
+          }
+          load()
+          return () => { alive = false; if (timer !== null) clearTimeout(timer) }
+        }, [])
+
+        // severity 只认 error，其余（含字段缺失）一律按 warn 渲染，避免出现没样式的条
+        const alertSeverity = alert === null ? null : (alert.severity === 'error' ? 'error' : 'warn')
+        const alertIcon = alert === null ? '' : (alertSeverity === 'error' ? '⛔' : '⚠')
+        const alertText = alert === null ? '' : `${alert.label}${alert.since ? ` · ${alert.since} 起` : ''}`
+        const alertTitle = alert === null ? '' : [
+          alert.title,
+          alert.components ? `受影响：${alert.components}` : '',
+          alert.since ? `${alert.since} 起` : '',
+        ].filter(Boolean).join('\n')
+        const hint = alert === null ? null : React.createElement('a', {
+          className: `dshus-hint dshus-hint-${alertSeverity}`,
+          href: alert.url,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          title: alertTitle,
+        },
+          React.createElement('span', { className: 'dshus-hint-icon' }, alertIcon),
+          React.createElement('span', { className: 'dshus-hint-text' }, alertText),
+          React.createElement('span', { className: 'dshus-hint-arrow' }, '↗'))
+        // 收起态空间只够一个图标：整项让给告警，tooltip 里给全信息
+        const railAlert = alert === null ? null : React.createElement('a', {
+          className: `dshus-rail dshus-rail-alert dshus-hint-${alertSeverity}`,
+          href: alert.url,
+          target: '_blank',
+          rel: 'noopener noreferrer',
+          title: alertTitle,
+        }, alertIcon)
+        const withHint = (children) => React.createElement('div', { className: 'dshus-wrap' }, hint, children)
+
         const head = React.createElement('div', { className: 'dshus-headrow' },
           React.createElement('a', {
             className: 'dshus-head',
@@ -149,16 +222,16 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
             : null)
 
         if (data === null) {
-          return React.createElement('div', { className: 'dshus-block' }, head,
-            React.createElement('div', { className: 'dshus-loading' }, '统计中…'))
+          if (!wide && railAlert !== null) return railAlert
+          return withHint(React.createElement('div', { className: 'dshus-block' }, head,
+            React.createElement('div', { className: 'dshus-loading' }, '统计中…')))
         }
 
         if (data.status !== 'ready') {
           const message = data.scanHint || data.officialError || '官方数据暂不可用'
-          return wide
-            ? React.createElement('div', { className: 'dshus-block' }, head,
-                React.createElement('div', { className: 'dshus-loading' }, message))
-            : React.createElement('div', { className: 'dshus-rail', title: message }, 'Σ —')
+          if (!wide) return railAlert !== null ? railAlert : React.createElement('div', { className: 'dshus-rail', title: message }, 'Σ —')
+          return withHint(React.createElement('div', { className: 'dshus-block' }, head,
+            React.createElement('div', { className: 'dshus-loading' }, message)))
         }
 
         const todayLine = React.createElement('div', { className: 'dshus-row' },
@@ -171,9 +244,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           React.createElement('span', { className: 'dshus-cost' }, formatMoney(data.month.cost, data.currency)))
 
         if (wide) {
-          return React.createElement('div', { className: 'dshus-block' }, head, todayLine, monthLine,
-            data.scanHint ? React.createElement('div', { className: 'dshus-loading' }, data.scanHint) : null)
+          return withHint(React.createElement('div', { className: 'dshus-block' }, head, todayLine, monthLine,
+            data.scanHint ? React.createElement('div', { className: 'dshus-loading' }, data.scanHint) : null))
         }
+        if (railAlert !== null) return railAlert
         return React.createElement('div', {
           className: 'dshus-rail',
           title: `今日 ${formatCompactTokens(data.today.tokens)} tok · ${formatMoney(data.today.cost, data.currency)}，本月 ${formatCompactTokens(data.month.tokens)} tok${data.scanHint ? `\n${data.scanHint}` : ''}`,
