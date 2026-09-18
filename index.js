@@ -60,17 +60,25 @@ const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频
 // 官方端点（platform userToken → 私有 dashboard 接口）
 // ---------------------------------------------------------------------------
 
+/**
+ * 读取配置文件。返回 `{ token, autoScan }`；`token: null` 表示"配置里没有可用 token"
+ * （含文件不存在）。返回 `null` 表示**读取/解析失败**——调用方保留上一次生效的配置，
+ * 不因为一次 IO 抖动或半写入的 JSON 把已配置的 token 判死（那会误报"请配置 platformToken"）。
+ */
 function readConfigFile() {
+  let text
   try {
     // P2：明文 token 文件必须 owner-only；权限过宽则自动收紧到 0600
-    try {
-      const st = statSync(TOKEN_FILE)
-      if ((st.mode & 0o077) !== 0) chmodSync(TOKEN_FILE, 0o600)
-    } catch (err) {
-      return null
-    }
-    const text = readFileSync(TOKEN_FILE, 'utf8')
-    if (!text) return null
+    const st = statSync(TOKEN_FILE)
+    if ((st.mode & 0o077) !== 0) chmodSync(TOKEN_FILE, 0o600)
+    text = readFileSync(TOKEN_FILE, 'utf8')
+  } catch (err) {
+    // 文件被删掉 = 用户明确撤销配置；其他 IO 失败不清空
+    if (err && err.code === 'ENOENT') return { token: null, autoScan: false }
+    return null
+  }
+  if (!text) return { token: null, autoScan: false }
+  try {
     const j = JSON.parse(text)
     const raw = j && (j.platformToken !== undefined ? j.platformToken : (typeof j.value === 'string' ? j.value : null))
     let token = null
@@ -86,7 +94,7 @@ function readConfigFile() {
  * 自动获取：扫描本机 Chromium 系浏览器（Chrome / Edge / Brave / Arc）各 Profile
  * 的 Local Storage LevelDB，提取 platform.deepseek.com 的 userToken 候选。
  * 启发式解析（不引入 LevelDB 依赖）：记录形如 `userToken<len>base64值`，
- * 直接用正则抓取值主体，交给 isValidToken 校验。
+ * 直接用正则抓取值主体，交给 probeToken 校验。
  */
 const BROWSER_ROOTS = [
   join(homedir(), 'Library', 'Application Support', 'Google', 'Chrome'),
@@ -191,32 +199,57 @@ function isAuthError(payload) {
   return code === 40002 || code === 40003 || bizCode === 40002 || bizCode === 40003
 }
 
-async function isValidToken(token) {
+/** HTTP 401/403 只有**平台自己以 JSON 拒绝**时才算 token 失效；WAF 拦截页同样用
+ *  403/429，但返回 text/html（"Request Blocked"）——那是"没问到"，不是"token 无效"。 */
+function isAuthHttpResponse(response) {
+  if (response.status !== 401 && response.status !== 403) return false
+  return String(response.headers.get('content-type') || '').includes('json')
+}
+
+/**
+ * 探测 token：`'valid' | 'invalid' | 'unknown'`。
+ * 只有平台**明确拒绝**（业务码 40002/40003、或带 JSON 体的 401/403）才是 `'invalid'`；
+ * 网络错误、超时、限流 429、5xx、WAF 拦截页一律 `'unknown'`——一次请求失败不能证明
+ * token 无效，据此把用户配置好的 token 丢掉会误报"请配置有效的 platformToken"。
+ */
+async function probeToken(token) {
   try {
-    const j = await fetchJson('/api/v0/users/get_user_summary', token, AbortSignal.timeout(8000))
-    return !!(j && j.code === 0)
+    const response = await fetch(`${PLATFORM_BASE}/api/v0/users/get_user_summary`, {
+      headers: { ...OFFICIAL_HEADERS, Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!response.ok) return isAuthHttpResponse(response) ? 'invalid' : 'unknown'
+    const j = await response.json()
+    if (j && j.code === 0) return 'valid'
+    return isAuthError(j) ? 'invalid' : 'unknown'
   } catch (err) {
-    return false
+    return 'unknown'
   }
 }
 
-// token 解析状态：手动配置优先（有效则一直用，auth 失败才失效）。
+// token 解析状态：手动配置优先。
 // P1：浏览器自动扫描为显式 opt-in —— 需配置文件里 `"autoScan": true`，
 // 默认关闭，避免把其他网站的 userToken 形式字符串发往 DeepSeek 验证。
 // userToken 是长效会话（数周~数月），只在登录/登出/改密时变化：
 // 配置文件用 stat 变更检测（每次查询前），浏览器扫描 6 小时一次 + 失效强制。
 const BROWSER_SCAN_MS = 6 * 60 * 60 * 1000
+// 手动 token 被平台**明确拒绝**后的冷却：期间改走浏览器候选，冷却期满自动再试一次。
+// 关键是"明确拒绝"才进入冷却——超时/429/WAF 拦页不算，不能把配置好的 token 判死。
+const MANUAL_RETRY_MS = 10 * 60 * 1000
+// 浏览器候选全部"没问到"（unknown）时的重试间隔：不能把一次断网/限流记成"没有 token"
+const SCAN_RETRY_MS = 5 * 60 * 1000
 
 const tokenState = {
-  manual: null,        // 配置文件读到的 token（null = 无/已失效）
-  manualValid: false,  // 配置 token 是否已验证有效
-  autoScan: false,     // 是否启用浏览器自动扫描（opt-in）
-  configCheckedAt: 0,  // 上次重读配置文件时间
-  scanCheckedAt: 0,    // 上次扫描浏览器时间
-  exhaustedAt: null,   // 上次全量校验候选且无有效 token 的时间（避免每次查询重复校验）
-  candidates: [],      // 浏览器扫描到的候选
-  browserValid: null,  // 已验证有效的浏览器 token
-  configGeneration: 0, // 配置每变化一次 +1，官方缓存据此失效
+  manual: null,           // 配置文件读到的 token（只由配置文件决定，不因请求结果丢弃）
+  manualRejectedAt: null, // 平台明确拒绝该 token 的时间（null = 没被拒过）
+  autoScan: false,        // 是否启用浏览器自动扫描（opt-in）
+  configCheckedAt: 0,     // 上次重读配置文件时间
+  scanCheckedAt: 0,       // 上次扫描浏览器时间
+  exhaustedAt: null,      // 上次全量校验候选的时间（避免每次查询重复校验）
+  exhaustedTransient: false, // 上次穷尽是否只是因为"没问到"（true 则用 SCAN_RETRY_MS 重试）
+  candidates: [],          // 浏览器扫描到的候选
+  browserValid: null,      // 已验证有效的浏览器 token
+  configGeneration: 0,     // 配置每变化一次 +1，官方缓存据此失效
 }
 
 /** 配置文件的 inode+mtime+size 签名；每次官方查询前轻量检测。 */
@@ -236,13 +269,15 @@ function configFileChanged() {
 
 /** 应用一次配置读取：token / autoScan 变化时重置对应状态并 bump 代数。 */
 function applyConfig(cfg) {
-  const newManual = cfg ? cfg.token : null
+  // 读不到配置（IO 抖动 / 半写入的 JSON）时保留上一次生效的配置
+  if (cfg === null) return
+  const newManual = cfg.token
   if (newManual !== tokenState.manual) {
     tokenState.manual = newManual
-    tokenState.manualValid = false
+    tokenState.manualRejectedAt = null // 换了 token，重新给一次机会
     tokenState.configGeneration += 1
   }
-  const newAutoScan = cfg ? cfg.autoScan : false
+  const newAutoScan = cfg.autoScan
   if (newAutoScan !== tokenState.autoScan) {
     tokenState.autoScan = newAutoScan
     tokenState.configGeneration += 1
@@ -270,27 +305,36 @@ async function resolveToken(forceRescan = false) {
     tokenState.browserValid = null
     tokenState.exhaustedAt = null // 新候选集，重置"无有效 token"记忆
   }
-  // 1) 手动配置：已验证则直接复用（auth 失败才会被置失效）
-  if (tokenState.manual !== null && tokenState.manualValid) return tokenState.manual
+  // 1) 手动配置优先：**不做前置探测，直接使用**——token 是否有效由真实数据请求判定
+  //    （fetchOfficial 的 auth 分支）。前置探测把 429/超时/WAF 拦截页误当"token 无效"，
+  //    会丢掉配置好的有效 token，界面随之误报"请配置有效的 platformToken"。
+  //    只有被平台明确拒绝后才进入冷却，冷却期改走浏览器候选，期满自动再试。
   if (tokenState.manual !== null) {
-    if (await isValidToken(tokenState.manual)) {
-      tokenState.manualValid = true
+    const cooling = tokenState.manualRejectedAt !== null && now - tokenState.manualRejectedAt < MANUAL_RETRY_MS
+    if (!cooling) {
+      tokenState.manualRejectedAt = null
       return tokenState.manual
     }
-    tokenState.manual = null
   }
   // 2) 浏览器自动获取：优先复用已验证的，否则逐候选校验
   if (tokenState.browserValid !== null) return tokenState.browserValid
-  // 已全量校验过且无有效 token：在下次扫描前不再重复校验，避免每次查询都校验全部候选
-  if (forceRescan || tokenState.exhaustedAt === null || now - tokenState.exhaustedAt > BROWSER_SCAN_MS) {
-    tokenState.exhaustedAt = now
+  // 已全量校验过且无有效 token：在下次扫描前不再重复校验，避免每次查询都校验全部候选。
+  // 但"没问到"（unknown）只是暂时的——用更短的窗口重试，别把断网记成"没有 token"。
+  const retryWindow = tokenState.exhaustedTransient ? SCAN_RETRY_MS : BROWSER_SCAN_MS
+  if (forceRescan || tokenState.exhaustedAt === null || now - tokenState.exhaustedAt > retryWindow) {
+    let sawUnknown = false
     for (const candidate of tokenState.candidates) {
-      if (await isValidToken(candidate)) {
+      const verdict = await probeToken(candidate)
+      if (verdict === 'valid') {
         tokenState.browserValid = candidate
         tokenState.exhaustedAt = null
+        tokenState.exhaustedTransient = false
         return candidate
       }
+      if (verdict === 'unknown') sawUnknown = true
     }
+    tokenState.exhaustedAt = now
+    tokenState.exhaustedTransient = sawUnknown
   }
   return null
 }
@@ -301,9 +345,10 @@ async function fetchJson(path, token, signal) {
     signal,
   })
   if (!response.ok) {
-    // P2-3：HTTP 401/403 也是 token 失效信号——交给 isAuthError 触发重扫，
-    // 而不是直接抛错绕过鉴权重试逻辑；其他状态码仍按网络错误处理。
-    if (response.status === 401 || response.status === 403) {
+    // P2-3：平台以 JSON 体的 401/403 拒绝 = token 失效，交给 isAuthError 触发重扫，
+    // 而不是直接抛错绕过鉴权重试逻辑。注意 WAF 拦截页也用 403/429 但返回 text/html，
+    // 那是"没问到"，不能当成 token 失效（否则界面会误报"请配置有效的 platformToken"）。
+    if (isAuthHttpResponse(response)) {
       return { __authError: true, __status: response.status }
     }
     throw new Error(`HTTP ${response.status}`)
@@ -463,15 +508,19 @@ async function fetchOfficial() {
 
   let [amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(token)
   if ([amountRes, costRes, summaryRes, byKeyAmount, byKeyCost].some(isAuthError)) {
-    // token 失效：全部失效 + 强制重扫（配置重读 + 浏览器重扫），用新 token 重试一次
-    tokenState.manual = null
-    tokenState.manualValid = false
-    tokenState.browserValid = null
+    // token 被平台明确拒绝：记下拒绝时间（**不丢掉配置里的 token**），强制重扫
+    // （配置重读 + 浏览器重扫），冷却期内 resolveToken 会改用浏览器候选，用新 token 重试一次
+    if (token === tokenState.manual) tokenState.manualRejectedAt = Date.now()
+    else tokenState.browserValid = null
     tokenState.configCheckedAt = 0
     tokenState.scanCheckedAt = 0
     const retried = await resolveToken(true)
-    if (retried === null) throw new Error('platform token invalid and no fresh candidate')
+    if (retried === null) throw new Error('platform token rejected and no fresh candidate')
     ;[amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(retried)
+    if ([amountRes, costRes, summaryRes, byKeyAmount, byKeyCost].some(isAuthError)) {
+      if (retried === tokenState.manual) tokenState.manualRejectedAt = Date.now()
+      else tokenState.browserValid = null
+    }
   }
   return parseOfficialPayload(amountRes, costRes, summaryRes, byKeyAmount, byKeyCost)
 }
@@ -822,15 +871,24 @@ export async function apply(ctx) {
             payload.currency = official.currency
             payload.balance = official.balance
           } else {
-            payload.status = tokenState.manual === null && !tokenState.autoScan ? 'configuration_required' : 'unavailable'
-            payload.officialError = payload.status === 'configuration_required'
+            // 只有"确实没有可用 token"或"平台明确拒绝了这个 token"才让用户去改配置；
+            // 拉取失败（超时/限流/WAF/服务端 5xx）是"暂不可用"，不能谎称 token 没配好。
+            const noToken = tokenState.manual === null && !tokenState.autoScan
+            const rejected = tokenState.manual !== null && tokenState.manualRejectedAt !== null
+            payload.status = (noToken || rejected) ? 'configuration_required' : 'unavailable'
+            payload.officialError = noToken
               ? '请配置有效的 platformToken 以查看官方用量'
-              : '官方数据暂不可用，请稍后重试'
-            // P2-4：autoScan 开着却拿不到有效 token 时，明确提示（避免默默兜底让人困惑）
+              : rejected
+                ? 'platformToken 已被平台拒绝（可能已过期），请重新获取后更新配置'
+                : '官方数据暂不可用，请稍后重试'
+            // P2-4：autoScan 开着却拿不到有效 token 时，明确提示（避免默默兜底让人困惑）。
+            // "没问到"（unknown）不能说成"候选无效"——那同样是把请求失败当成结论。
             if (tokenState.autoScan) {
               payload.scanHint = tokenState.candidates.length === 0
                 ? 'autoScan 未在浏览器里找到 userToken，请登录 platform.deepseek.com 后重试，或手动配置 platformToken'
-                : 'autoScan 找到的候选均无效（可能含过期/其他网站的 token），建议手动配置 platformToken'
+                : tokenState.exhaustedTransient
+                  ? 'autoScan 候选暂未校验成功（官方请求失败），稍后会自动重试'
+                  : 'autoScan 找到的候选均无效（可能含过期/其他网站的 token），建议手动配置 platformToken'
             }
           }
           send(200, payload)
