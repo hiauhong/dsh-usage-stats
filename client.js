@@ -38,14 +38,83 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       return `余额 ${symbol}${truncate2(amount).toFixed(2)}`
     }
 
-    // 恢复原有北京时间时段提示；仅用于展示，不参与 token 或费用计算。
-    function pricingTier() {
-      const now = new Date(Date.now() + 8 * 60 * 60 * 1000)
-      const h = now.getUTCHours()
-      const day = now.getUTCDay()
-      if (day === 0 || day === 6) return '空闲'
-      return (h >= 9 && h < 12) || (h >= 14 && h < 18) ? '高峰' : '空闲'
+    // --- 峰谷时段逻辑（回归测试按这两个标记切片，别删这两行注释）-----------------
+    // 规则来源（口径以官方为准，改前先核对）：
+    //   1) 文档「模型 & 价格」脚注：空闲价为高峰价一半；北京时间**周一至周五（不含
+    //      中国法定节假日）9:00-12:00、14:00-18:00 为高峰**；其余时段，包括周末及
+    //      中国法定节假日全天，均为空闲。
+    //      https://api-docs.deepseek.com/zh-cn/quick_start/pricing
+    //   2) 2026-09-19《DeepSeek API 峰谷时间说明》：**调休上班的周末**、中国法定节假日
+    //      全天均按空闲时段计费 —— 即「调休补班」不会把周末变成高峰。
+    // 节假日取《国务院办公厅关于 2026 年部分节假日安排的通知》的「放假」区间（含调休
+    // 拼出的连休，如国庆 10/1-7；区间内的 10/5-7 是调休工作日，按官方口径仍算节假日全天）。
+    //   https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm
+    // 本标签只做展示，不参与 token 或费用计算（金额一律取官方数据）。
+    const CN_HOLIDAY_YEAR = 2026 // 每年 11 月前后国务院发布下一年安排，届时补一段
+    const CN_HOLIDAYS = [
+      ['2026-01-01', '2026-01-03', '元旦'],
+      ['2026-02-15', '2026-02-23', '春节'],
+      ['2026-04-04', '2026-04-06', '清明'],
+      ['2026-05-01', '2026-05-05', '劳动节'],
+      ['2026-06-19', '2026-06-21', '端午'],
+      ['2026-09-25', '2026-09-27', '中秋'],
+      ['2026-10-01', '2026-10-07', '国庆'],
+    ]
+    // 调休上班的周末（通知里「X 月 X 日（周六/周日）上班」那些天）：判定上等同普通周末，
+    // 这里只用来把 tooltip 说清楚 —— 谁要是把补班日当工作日算高峰，就踩到 2026-09-19 公告。
+    const CN_MAKEUP_WEEKENDS = [
+      '2026-01-04', '2026-02-14', '2026-02-28', '2026-05-09', '2026-09-20', '2026-10-10',
+    ]
+    const PEAK_HOUR_RANGES = [[9, 12], [14, 18]]
+
+    function cnHolidayName(ymd) {
+      for (const [start, end, name] of CN_HOLIDAYS) {
+        if (ymd >= start && ymd <= end) return name
+      }
+      return null
     }
+
+    // 北京时间（固定 UTC+8：中国自 1991 年起无夏令时）。nowMs 可注入，便于测试。
+    function beijingTime(nowMs) {
+      const d = new Date((nowMs === undefined ? Date.now() : nowMs) + 8 * 60 * 60 * 1000)
+      return {
+        year: d.getUTCFullYear(),
+        hour: d.getUTCHours(),
+        weekday: d.getUTCDay(),
+        ymd: d.toISOString().slice(0, 10),
+      }
+    }
+
+    // 当前计费时段：{ label: '高峰' | '空闲', hint }。hint 只进 tooltip，不占版面。
+    function pricingTier(nowMs) {
+      const { year, hour, weekday, ymd } = beijingTime(nowMs)
+      // 跨年后国务院还没发新安排时的兜底：照工作日时段的规则走，但把话说出来
+      const stale = year > CN_HOLIDAY_YEAR
+        ? `（节假日数据截至 ${CN_HOLIDAY_YEAR} 年，${year} 年安排发布后需更新）`
+        : ''
+      // 先认节假日再认周末：假期与周末重叠时（如 2026-10-03 周六在国庆里），
+      // 说「国庆假期」比说「周末」更贴事实
+      const holiday = cnHolidayName(ymd)
+      if (holiday !== null) {
+        return { label: '空闲', hint: `${holiday}假期全天按空闲时段计费${stale}` }
+      }
+      if (weekday === 0 || weekday === 6) {
+        const makeup = CN_MAKEUP_WEEKENDS.indexOf(ymd) >= 0
+          ? '；官方明确：调休上班的周末也按空闲时段计费'
+          : ''
+        return { label: '空闲', hint: `周末全天按空闲时段计费${makeup}${stale}` }
+      }
+      for (const [from, to] of PEAK_HOUR_RANGES) {
+        if (hour >= from && hour < to) {
+          return { label: '高峰', hint: `工作日高峰时段 ${from}:00-${to}:00（北京时间）${stale}` }
+        }
+      }
+      return {
+        label: '空闲',
+        hint: `工作日非高峰时段（高峰为 9:00-12:00、14:00-18:00，北京时间）${stale}`,
+      }
+    }
+    // --- 峰谷时段逻辑结束 -------------------------------------------------------
 
     module.exports.inject = ['slots']
 
@@ -204,6 +273,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         }, alertIcon)
         const withHint = (children) => React.createElement('div', { className: 'dshus-wrap' }, hint, children)
 
+        // 峰谷标签：每次渲染取当前时刻（卡片每 60s 刷新一次，跨时段最迟 1 分钟翻牌）
+        const tier = data !== null ? pricingTier() : null
+
         const head = React.createElement('div', { className: 'dshus-headrow' },
           React.createElement('a', {
             className: 'dshus-head',
@@ -214,8 +286,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           },
             React.createElement('span', { className: 'dshus-title' }, '用量信息'),
             React.createElement('span', { className: 'dshus-link' }, '↗'),
-            data !== null
-              ? React.createElement('span', { className: 'dshus-badge' }, pricingTier())
+            tier !== null
+              ? React.createElement('span', { className: 'dshus-badge', title: tier.hint }, tier.label)
               : null),
           data !== null && data.balance !== null && data.balance !== undefined
             ? React.createElement('span', { className: 'dshus-balance' }, formatBalance(data.balance.amount, data.balance.currency))

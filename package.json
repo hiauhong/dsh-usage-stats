@@ -15,8 +15,8 @@
     "cordis.patch.yml",
     "README.md",
     "LICENSE",
-    "example.png",
-    "example-status.png"
+    "example-status.png",
+    "example-update.png"
   ],
   "keywords": [
     "deepseek",
