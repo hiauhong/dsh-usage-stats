@@ -127,6 +127,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
            形态见 backlog/specs/服务状态提示.md（原型定稿的变体 A）。 */
         .dshus-hint {
           display: flex; align-items: center; gap: 5px; min-width: 0;
+          flex: none; /* 不可压缩：告警行被压扁过一次（见下 .dshus-block 的注释） */
           margin: 0 0 3px; padding: 3px var(--dsh-sidebar-inline-padding);
           border-radius: 4px; font-size: 11px; line-height: 1.4; text-decoration: none;
           white-space: nowrap; overflow: hidden;
@@ -143,7 +144,13 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           background: color-mix(in srgb, var(--dsw-alias-state-error-primary) 16%, transparent);
         }
         .dshus-block {
-          display: flex; flex-direction: column; gap: 3px; flex: 0 0 100%;
+          /* flex: none，别写 100%：这个卡片始终在 column 方向的 .dshus-wrap 里，
+             那里的 flex-basis 100% 是**高度**（不是宽度）—— 它会吃掉整个 wrap 高度，
+             把上面的告警行挤成 6px（告警自身 overflow:hidden 于是一半字被裁）。
+             实测（2026-09-20，注入告警行后量 DOM）：flex:0 0 100% 时告警行 6px/内容 14px；
+             改 none 后 21.4px，卡片回到自然高度 70.2px，wrap = 三者之和 94.6px。
+             宽度不受影响：column 容器里靠 align-items: stretch 撑满。 */
+          display: flex; flex-direction: column; gap: 3px; flex: none;
           min-width: 0; padding: 7px var(--dsh-sidebar-inline-padding); box-sizing: border-box;
           font-size: 11px; line-height: 1.4; color: var(--dsw-alias-label-primary);
         }
