@@ -43,8 +43,11 @@ const STATUS_CHECK_TTL_MS = 5 * 60 * 1000
 const STATUS_CHECK_TTL_ACTIVE_MS = 30 * 1000
 // 僵尸保护：RSS 卡住或某条一直没写 resolved 时，不要把陈年条目永远挂在界面上
 const STATUS_MAX_AGE_MS = 12 * 60 * 60 * 1000
-// 版本检测（Host 侧）：读取运行中 DSH 的版本（从其 package.json），定期拉取 npm
-// 最新版，比较后决定是否在品牌行显示「有新版」。有新版才提示，无新版隐藏。
+// 版本检测（Host 侧）：读取运行中 DSH 的版本（从其 package.json），拉取官方「最新
+// 可装版本」（GitHub Releases 的 tag + npm 的发布 tag），比较后决定是否在品牌行显示
+// 「有新版」。有新版才提示，无新版隐藏。
+// 只看 GitHub Releases 的正式 tag（release candidate 与正式版），**排除 alpha**：
+// alpha 是内部构建、官方下一步往往自己就弃了，不该催用户升（用户 2026-09-23 明确口径）。
 // 运行中 DSH 的安装根目录：realpath 解掉 bin/dsh 符号链接，避免 dirname(argv[1])/..
 // 落到 nvm 根目录（无 package.json）。解不开则退回字面路径。
 function resolveDshInstallRoot() {
@@ -58,8 +61,14 @@ function resolveDshInstallRoot() {
 const DSH_INSTALL_ROOT = resolveDshInstallRoot()
 const DSH_PKG_JSON = join(DSH_INSTALL_ROOT, 'package.json')
 const NPM_DIST_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh'
+// 只取 releases 列表（不需要 release 正文），每页 100 条足够覆盖历史；未认证 60 次/小时
+// 的限额对「1 小时一轮」也绰绰有余。
+const RELEASES_API_URL = 'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=100'
 const RELEASES_URL = 'https://github.com/deepseek-ai/deepseek-harness/releases'
-const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频，避免频繁打 npm
+// 发布 tag 形如 `dsh-v0.1.7-rc.1`（仓库里不止 DSH 一个包，tag 带 `dsh-` 前缀）；
+// 兼容去掉前缀的写法（`v0.1.7-rc.1` / `0.1.7-rc.1`），也放过 `dsh-cli-v*` 这类别的包。
+const RELEASE_TAG_RE = /^(?:dsh-)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/
+const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频，避免频繁打 GitHub / npm
 
 // ---------------------------------------------------------------------------
 // 官方端点（platform userToken → 私有 dashboard 接口）
@@ -586,48 +595,147 @@ function installedDshVersion() {
   }
 }
 
-// npm registry：@deepseek-ai/dsh 的 dist-tags.latest。（仅 GET，无副作用）
-async function fetchLatestDshVersion() {
+// npm registry 的发布 tag（仅 GET，无副作用）：`next` 是预发布通道的指针，rc 版本
+// 常常先挂在这里，而 `latest` 要等它转正才动。两个 tag 都留着 —— GitHub Releases、
+// npm `next`、npm `latest` 任何一处出现更新都要能报出来。
+async function fetchNpmDistTags() {
   const response = await fetch(NPM_DIST_URL, {
     headers: { Accept: 'application/json', 'User-Agent': UA },
     signal: AbortSignal.timeout(15000),
   })
   if (!response.ok) throw new Error(`npm registry ${response.status}`)
   const json = await response.json()
-  const latest = json && json['dist-tags'] && json['dist-tags'].latest
-  return typeof latest === 'string' ? latest : null
+  const tags = json && json['dist-tags']
+  if (tags === null || typeof tags !== 'object') return {}
+  return tags
 }
 
-// 版本检测缓存：TTL 1h，in-flight 合并，失败不毒化缓存（下次重试）。
-let updateCache = null
-let updateInFlight = null
+// GitHub Releases：只认正式发布的 tag（rc 与正式版），**排除 alpha**（用户口径）。
+// 返回其中最高的版本号；一个可用的都没有（全 alpha / 空列表）返回 null —— 不是错误，
+// 而是「没有值得提示的可装版本」。
+async function fetchReleaseVersions() {
+  const response = await fetch(RELEASES_API_URL, {
+    headers: { Accept: 'application/vnd.github+json', 'User-Agent': UA },
+    signal: AbortSignal.timeout(15000),
+  })
+  if (!response.ok) throw new Error(`github releases ${response.status}`)
+  const json = await response.json()
+  if (!Array.isArray(json)) throw new Error('github releases: unexpected payload')
+  return highestReleaseVersion(json.map((release) => (release && typeof release.tag_name === 'string' ? release.tag_name : '')))
+}
 
-async function updateSnapshot() {
-  const now = Date.now()
-  if (updateCache !== null && now - updateCache.at < UPDATE_CHECK_TTL_MS) return updateCache.data
-  if (updateInFlight !== null) return updateInFlight.promise
-  const promise = (async () => {
-    try {
-      const installed = installedDshVersion()
-      const latest = await fetchLatestDshVersion()
-      const data = {
-        hasUpdate: installed !== null && latest !== null && compareVersions(latest, installed) > 0,
-        installed,
-        latest,
-        url: RELEASES_URL,
+// 每个来源一个独立备忘：某一源挂了（GitHub 限流、npm 抖动）不该把另一源的结果一起作废。
+// 只记成功结果；空结果也记（「当前没有 rc/正式版」是事实，1 小时内不会变）。
+function memoize(fn, ttlMs, now = Date.now) {
+  let cache = null
+  let inFlight = null
+  return async function call() {
+    const at = now()
+    if (cache !== null && at - cache.at < ttlMs) return cache.value
+    if (inFlight !== null) return inFlight
+    const promise = (async () => {
+      try {
+        const value = await fn()
+        cache = { at: now(), value }
+        return value
+      } finally {
+        inFlight = null
       }
-      updateCache = { at: Date.now(), data }
-      return data
-    } catch (err) {
-      updateCache = null
-      return { hasUpdate: false, installed: installedDshVersion(), latest: null, url: RELEASES_URL, error: String(err) }
-    } finally {
-      updateInFlight = null
-    }
-  })()
-  updateInFlight = { promise }
-  return promise
+    })()
+    inFlight = promise
+    return promise
+  }
 }
+
+// tag → 版本号；不是本仓 DSH 的发布 tag（或解析不出）返回 null，直接忽略。
+function releaseTagToVersion(tag) {
+  const m = RELEASE_TAG_RE.exec(String(tag).trim())
+  if (m === null) return null
+  const version = m[1]
+  return isAlphaVersion(version) ? null : version
+}
+
+// alpha 是内部构建，不催用户升（见文件头版本检测注释）。
+function isAlphaVersion(version) {
+  const parsed = parseVersion(version)
+  return parsed !== null && parsed.prerelease.includes('alpha')
+}
+
+// 从一堆发布 tag 里挑出最高的可提示版本；全都不可用则 null。
+function highestReleaseVersion(tags) {
+  let best = null
+  for (const tag of tags) {
+    const version = releaseTagToVersion(tag)
+    if (version === null) continue
+    if (best === null || compareVersions(version, best) > 0) best = version
+  }
+  return best
+}
+
+// 「最新可装版本」= GitHub Releases（rc/正式）与 npm 两个发布 tag 里最高的那个。
+// rc 的版本号本身带 `-rc.N`，compareVersions 已经把预发布段算进去（正式版 > 同号 rc，
+// rc.2 > rc.1），所以这里不用再区分通道，只取最大值。全部来源都失败时抛错 → 不缓存、下次重试。
+async function fetchLatestDshVersion(deps) {
+  const { npmDistTags, releaseVersions } = deps
+  const attempts = [
+    async () => releaseVersions(),
+    async () => (await npmDistTags()).latest,
+    async () => (await npmDistTags()).next,
+  ]
+  const values = await Promise.allSettled(attempts.map((attempt) => attempt()))
+  let best = null
+  let ok = 0
+  for (const settled of values) {
+    if (settled.status !== 'fulfilled') continue
+    ok += 1
+    const value = settled.value
+    if (typeof value !== 'string' || parseVersion(value) === null) continue
+    if (best === null || compareVersions(value, best) > 0) best = value
+  }
+  if (ok === 0) throw new Error('all version sources failed')
+  return best
+}
+
+// 版本检测快照：TTL 1 小时（版本变更极低频）、in-flight 合并，失败不毒化缓存（下次重试）。
+// 工厂形态是为了给测试留缝：注入 now / fetchLatest 就能用假时钟与假来源验证「取哪个版本、
+// 什么时候复用缓存、alpha 被排除」（见 Scripts/test-update-check.mjs）。
+function createUpdateSnapshot({ fetchLatest, installed = installedDshVersion, now = Date.now, ttlMs = UPDATE_CHECK_TTL_MS } = {}) {
+  let cache = null
+  let inFlight = null
+  return async function snapshot() {
+    const at = now()
+    if (cache !== null && at - cache.at < ttlMs) return cache.data
+    if (inFlight !== null) return inFlight
+    const promise = (async () => {
+      try {
+        const current = installed()
+        const latest = await fetchLatest()
+        const data = {
+          hasUpdate: current !== null && latest !== null && compareVersions(latest, current) > 0,
+          installed: current,
+          latest,
+          url: RELEASES_URL,
+        }
+        cache = { at: now(), data }
+        return data
+      } catch (err) {
+        cache = null
+        return { hasUpdate: false, installed: installed(), latest: null, url: RELEASES_URL, error: String(err) }
+      } finally {
+        inFlight = null
+      }
+    })()
+    inFlight = promise
+    return promise
+  }
+}
+
+const updateSnapshot = createUpdateSnapshot({
+  fetchLatest: () => fetchLatestDshVersion({
+    npmDistTags: memoize(fetchNpmDistTags, UPDATE_CHECK_TTL_MS),
+    releaseVersions: memoize(fetchReleaseVersions, UPDATE_CHECK_TTL_MS),
+  }),
+})
 
 // ---------------------------------------------------------------------------
 // DeepSeek 服务状态（status.deepseek.com）
@@ -976,4 +1084,4 @@ export async function apply(ctx) {
 }
 
 // 仅供本地校验解析与缓存策略（判据来自真实 feed 的真实形状）
-export const __test = { parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml, createStatusSnapshot }
+export const __test = { parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml, createStatusSnapshot, compareVersions, parseVersion, isAlphaVersion, releaseTagToVersion, highestReleaseVersion, createUpdateSnapshot, fetchLatestDshVersion }

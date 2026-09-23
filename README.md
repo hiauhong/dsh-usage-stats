@@ -95,12 +95,23 @@ autoScan 会读取各浏览器 profile 的 `Local Storage/leveldb`，启发式�
 插件在左上角品牌行（`deepseek HARNESS` 右侧）检测 DSH 是否有新版：
 
 - **判定**：读取运行中 DSH 的版本（与 `dsh --version` 同源，取自其 `package.json`），
-  对比 npm 上 `@deepseek-ai/dsh` 的 `dist-tags.latest`；最新版比本地新即显示「有新版」，
-  无更新则隐藏。支持 `-rc.N` 预发布版本比较。
-- **频率**：本地缓存 1 小时、页面低频轮询（版本变更极低频），避免频繁请求 npm。
+  对比**最新可装版本**；比本地新即显示「有新版」，无更新则隐藏。
+- **最新可装版本怎么取**：**GitHub Releases 的发布 tag**（`dsh-v*`）为主，加上 npm 上
+  `@deepseek-ai/dsh` 的 `dist-tags.latest` 与 `dist-tags.next`，三者取最高。rc 版本发布时
+  只推进 Releases 和 npm 的 `next`，`latest` 要等转正才动 —— 只看 `latest` 会让跑 rc 的
+  用户永远检测不到新版（2026-09-23 就是这个漏报）。支持 `-rc.N` 预发布版本比较
+  （正式版 > 同号 rc，`rc.2` > `rc.1`）。
+- **只看 rc 与正式版，排除 alpha**：alpha 是内部构建，官方下一步往往自己就弃了，不催用户升。
+- **频率**：本地缓存 1 小时、页面低频轮询（版本变更极低频），避免频繁请求 GitHub / npm。
+  单个来源失败不牵连其他来源（GitHub 限流时仍看 npm）。
 - **点击**：只跳转 [deepseek-harness Releases](https://github.com/deepseek-ai/deepseek-harness/releases)，
   不会误触发品牌行的「新建会话」（已做点击冒泡隔离）。
-- 失败的 npm 请求不会被缓存，下次自动重试。
+- 失败的请求不会被缓存，下次自动重试但不报错。
+
+> 2026-09-23 修过一处漏报：装了 `0.1.7-rc.1` 却一直不亮徽章 —— 判定只看 npm 的
+> `dist-tags.latest`，而它当时停在 `0.1.5-rc.3`（rc 只推进 Releases 与 npm `next`）。
+> 私有开发仓另有回归测试 `Scripts/test-update-check.mjs`：23 项覆盖 tag 解析、alpha 排除、
+> 三源取最高、单源失败、TTL 与失败不缓存。
 
 ## 服务状态提示
 
