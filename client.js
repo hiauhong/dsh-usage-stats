@@ -12,7 +12,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
     const STATUS_ROUTE = '/api/usage-stats/status'
     const REFRESH_MS = 60000
     const UPDATE_POLL_MS = 3600 * 1000 // 版本检测低频：1 小时一轮
-    const STATUS_POLL_MS = 5 * 60 * 1000 // 服务状态更新是分钟级：5 分钟一轮
+    const STATUS_POLL_MS = 5 * 60 * 1000 // 服务状态无告警：5 分钟一轮（事故更新是分钟级，够用）
+    const STATUS_POLL_ALERT_MS = 60 * 1000 // 有告警：1 分钟一轮盯恢复，别让已解决的告警多挂几分钟
     const UPDATE_BADGE_TEXT = '有新版'
     const UPDATE_BADGE_CLASS = 'dshus-upd-badge'
 
@@ -233,22 +234,44 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         }, [])
 
         // 服务状态：只在「有影响」时出现。拉不到就按「没问题」处理（问不到 ≠ 出问题）。
+        // 有告警时改 1 分钟一轮 —— 5 分钟一轮会让「官方已标 resolved」多挂好几分钟
+        //（2026-09-23 实测：15:44 恢复，界面还挂着，刷新才消失）。host 侧也同步收紧到 30s，
+        // 两段加起来恢复最多 ~1 分钟就翻牌；没告警时仍是 5 分钟一轮。
         const [alert, setAlert] = React.useState(null)
         React.useEffect(() => {
           let alive = true
           let timer = null
+          let shown = null // 与 setAlert 同步的镜像：决定下一轮的间隔（state 读不到最新值）
+          const arm = () => {
+            // 任何时刻只留一个定时器；先排下一轮，fetch 挂死也不会让轮询停摆
+            if (timer !== null) clearTimeout(timer)
+            timer = setTimeout(load, shown === null ? STATUS_POLL_MS : STATUS_POLL_ALERT_MS)
+          }
+          const apply = (next) => {
+            if (next === shown) return
+            shown = next // 出告警→收紧节奏；恢复→放松。立刻重排，避免旧节奏再跑一轮
+            setAlert(next)
+            arm()
+          }
           const load = () => {
+            arm()
             fetch(STATUS_ROUTE, { headers: { Accept: 'application/json' } })
               .then((response) => (response.ok ? response.json() : null))
               .then((payload) => {
                 if (!alive) return
-                setAlert(payload !== null && typeof payload === 'object' && payload.active === true ? payload : null)
+                apply(payload !== null && typeof payload === 'object' && payload.active === true ? payload : null)
               })
-              .catch(() => { if (alive) setAlert(null) })
-            timer = setTimeout(load, STATUS_POLL_MS)
+              .catch(() => { if (alive) apply(null) })
           }
+          // 标签页在后台会被节流/冻结，定时器停摆；回到前台补拉一次（「刷新才消失」的另一半原因）
+          const onVisible = () => { if (document.visibilityState === 'visible') load() }
+          document.addEventListener('visibilitychange', onVisible)
           load()
-          return () => { alive = false; if (timer !== null) clearTimeout(timer) }
+          return () => {
+            alive = false
+            if (timer !== null) clearTimeout(timer)
+            document.removeEventListener('visibilitychange', onVisible)
+          }
         }, [])
 
         // severity 只认 error，其余（含字段缺失）一律按 warn 渲染，避免出现没样式的条

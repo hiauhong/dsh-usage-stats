@@ -36,6 +36,11 @@ const CACHE_TTL_MS = 60000
 const STATUS_FEED_URL = 'https://status.deepseek.com/history.rss'
 const STATUS_PAGE_URL = 'https://status.deepseek.com'
 const STATUS_CHECK_TTL_MS = 5 * 60 * 1000
+// 有告警时的缓存 TTL —— 它就是「恢复后多久消失」的滞后上限，不能和无告警时一样放满 5 分钟。
+// 2026-09-23 实测：15:35 起事故、15:44 官方标 resolved，侧边栏还挂着，手动刷新才消失；
+// 判定逻辑没错（resolved → active:false），是 host 5 分钟 TTL + 客户端 5 分钟轮询叠出来的 ~10 分钟。
+// 只在告警期提速：事故更新本来就是分钟级，正常时仍 5 分钟一轮，不折腾 status.deepseek.com。
+const STATUS_CHECK_TTL_ACTIVE_MS = 30 * 1000
 // 僵尸保护：RSS 卡住或某条一直没写 resolved 时，不要把陈年条目永远挂在界面上
 const STATUS_MAX_AGE_MS = 12 * 60 * 60 * 1000
 // 版本检测（Host 侧）：读取运行中 DSH 的版本（从其 package.json），定期拉取 npm
@@ -694,6 +699,20 @@ function parseStatusFeed(xml) {
   }
 }
 
+// idle 快照：没有影响（或问不到）时的形状。active:false 就是客户端撤掉告警的信号。
+function idleStatus() {
+  return {
+    active: false,
+    severity: null,
+    label: null,
+    title: null,
+    components: null,
+    since: null,
+    url: STATUS_PAGE_URL,
+    updatedAt: Date.now(),
+  }
+}
+
 // 判定「最新一条 item 算不算对用户有影响」——纯函数，便于对着真实 feed 校验。
 // 三个条件缺一不可：进行中（未 resolved）、够新（防僵尸）、组件与 API 有关。
 function evaluateStatusItem(item, now) {
@@ -713,49 +732,47 @@ function evaluateStatusItem(item, now) {
   }
 }
 
-// 状态快照：TTL 5 分钟 + in-flight 合并；失败不缓存（问不到 ≠ 出问题，下次轮询重试）。
-let statusCache = null
-let statusInFlight = null
-
-function idleStatus() {
-  return {
-    active: false,
-    severity: null,
-    label: null,
-    title: null,
-    components: null,
-    since: null,
-    url: STATUS_PAGE_URL,
-    updatedAt: Date.now(),
+// 状态快照：TTL 取决于上一份快照是不是「有告警」——有告警时盯恢复要快（30s），无告警时
+// 保持 5 分钟一轮。in-flight 合并；失败不缓存（问不到 ≠ 出问题，下次轮询重试）。
+// 工厂形态是为了给缓存策略留可测的缝：注入 now / fetchSnapshot 就能用假时钟量化「恢复滞后」，
+// 直接调下面的单例只能测判定、测不到多久翻牌（见 Scripts/test-status-recovery.mjs）。
+function createStatusSnapshot({ fetchSnapshot, now = Date.now, ttlIdle = STATUS_CHECK_TTL_MS, ttlActive = STATUS_CHECK_TTL_ACTIVE_MS }) {
+  let cache = null
+  let inFlight = null
+  const ttlFor = (data) => (data !== null && data.active === true ? ttlActive : ttlIdle)
+  return async function snapshot() {
+    const at = now()
+    if (cache !== null && at - cache.at < ttlFor(cache.data)) return cache.data
+    if (inFlight !== null) return inFlight
+    const promise = (async () => {
+      try {
+        const data = await fetchSnapshot()
+        cache = { at: now(), data }
+        return data
+      } catch {
+        cache = null
+        return idleStatus()
+      } finally {
+        inFlight = null
+      }
+    })()
+    inFlight = promise
+    return promise
   }
 }
 
-async function statusSnapshot() {
-  const now = Date.now()
-  if (statusCache !== null && now - statusCache.at < STATUS_CHECK_TTL_MS) return statusCache.data
-  if (statusInFlight !== null) return statusInFlight
-  const promise = (async () => {
-    try {
-      const response = await fetch(STATUS_FEED_URL, {
-        headers: { Accept: 'application/rss+xml, application/xml;q=0.9, */*;q=0.8', 'User-Agent': UA },
-        signal: AbortSignal.timeout(15000),
-      })
-      if (!response.ok) throw new Error(`status feed ${response.status}`)
-      const item = parseStatusFeed(await response.text())
-      if (item === null) throw new Error('status feed: no items')
-      const data = evaluateStatusItem(item, Date.now())
-      statusCache = { at: Date.now(), data }
-      return data
-    } catch {
-      statusCache = null
-      return idleStatus()
-    } finally {
-      statusInFlight = null
-    }
-  })()
-  statusInFlight = promise
-  return promise
+async function fetchStatusSnapshot() {
+  const response = await fetch(STATUS_FEED_URL, {
+    headers: { Accept: 'application/rss+xml, application/xml;q=0.9, */*;q=0.8', 'User-Agent': UA },
+    signal: AbortSignal.timeout(15000),
+  })
+  if (!response.ok) throw new Error(`status feed ${response.status}`)
+  const item = parseStatusFeed(await response.text())
+  if (item === null) throw new Error('status feed: no items')
+  return evaluateStatusItem(item, Date.now())
 }
+
+const statusSnapshot = createStatusSnapshot({ fetchSnapshot: fetchStatusSnapshot })
 
 // ---------------------------------------------------------------------------
 // 插件主体
@@ -958,5 +975,5 @@ export async function apply(ctx) {
   }
 }
 
-// 仅供本地校验解析逻辑（判据来自真实 feed 的真实形状）
-export const __test = { parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml }
+// 仅供本地校验解析与缓存策略（判据来自真实 feed 的真实形状）
+export const __test = { parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml, createStatusSnapshot }
