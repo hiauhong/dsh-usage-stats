@@ -59,12 +59,9 @@ function resolveDshInstallRoot() {
 const DSH_INSTALL_ROOT = resolveDshInstallRoot()
 const DSH_PKG_JSON = join(DSH_INSTALL_ROOT, 'package.json')
 const NPM_DIST_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh'
-// 只取 releases 列表（不需要 release 正文），每页 100 条足够覆盖历史；未认证 60 次/小时
-// 的限额对「1 小时一轮」也绰绰有余。
+// 只作徽章的跳转链接用 —— 版本检测本身只看 npm 的 dist-tags，不再请求 GitHub API。
 const RELEASES_URL = 'https://github.com/deepseek-ai/deepseek-harness/releases'
-// 发布 tag 形如 `dsh-v0.1.7-rc.1`（仓库里不止 DSH 一个包，tag 带 `dsh-` 前缀）；
-// 兼容去掉前缀的写法（`v0.1.7-rc.1` / `0.1.7-rc.1`），也放过 `dsh-cli-v*` 这类别的包。
-const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频，避免频繁打 GitHub / npm
+const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频，避免频繁打 npm
 
 // ---------------------------------------------------------------------------
 // 通用：TTL 缓存（三处快照共用一份实现）
@@ -357,7 +354,8 @@ async function fetchOfficial(token) {
   const fetchBatch = (t) => {
     const signal = AbortSignal.timeout(15000)
     // 单请求失败不整体抛错——转成标记，避免 5xx 并发时掩盖同批的
-    // 401/403 认证失败（__authError 仍需触发重扫）
+    // 401/403 认证失败（__authError 要能被 isAuthError 认出来：它决定界面说
+    // 「已被平台拒绝」还是「暂不可用」，两者不能混）
     const wrap = (p) => p.catch((err) => ({ __httpError: String(err && err.message ? err.message : err) }))
     return Promise.all([
       wrap(fetchJson(`/api/v0/usage/amount${query}`, t, signal)),
@@ -503,8 +501,8 @@ const updateSnapshot = createUpdateSnapshot()
 //   <strong>Status:</strong> resolved|investigating|...
 //   <strong>Affected components:</strong> <组件列表>
 // 所以「进行中」= 最新一条 item 的状态不是 resolved。
-// 注意：RSS 是否收录「进行中」的条目，只能等一次真实故障再验证；若它其实只发
-// 已恢复的历史，换源即可（下面的判定逻辑不用动）。
+// RSS 确实收录「进行中」的条目 —— 2026-09-23 的真实故障验证过（15:35 的性能下降被
+// 正常捕获）；若官方哪天改成只发已恢复的历史，换源即可（下面的判定逻辑不用动）。
 // 另：只有组件名带 "API" 的才算与 DSH 有关——搜索/上传/对话等服务异常不打扰用户。
 
 const XML_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' }

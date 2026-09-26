@@ -367,6 +367,14 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
 
       function ensureBadge() {
         if (!updateState.hasUpdate) { clearBadge(); return }
+        // observer 必须在**找到容器之前**就装上：它的全部用途就是等品牌行出现/被 React
+        // 重建后把徽章补回来。原先只在注入成功后才安装，于是首轮 /update 比品牌行渲染更快时
+        // （host 缓存命中就是这种：1 小时内刷新页面）徽章会被丢掉，且没有任何东西会重试，
+        // 要等下一轮轮询 —— 1 小时。
+        if (badgeObserver === null) {
+          badgeObserver = new MutationObserver(ensureBadge)
+          badgeObserver.observe(document.body, { childList: true, subtree: true })
+        }
         if (badgeAnchor && document.body.contains(badgeAnchor)) return
         const container = document.querySelector('[class*="brandIdentity"]')
         if (!container || container.querySelector(`.${UPDATE_BADGE_CLASS}`)) return
@@ -378,11 +386,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         badgeAnchor.textContent = UPDATE_BADGE_TEXT
         badgeAnchor.addEventListener('click', (event) => { event.stopPropagation() })
         container.appendChild(badgeAnchor)
-        if (badgeObserver === null) {
-          // React 渲染会重建品牌行 DOM，观察变化以便徽章被清掉后重新挂上
-          badgeObserver = new MutationObserver(ensureBadge)
-          badgeObserver.observe(document.body, { childList: true, subtree: true })
-        }
       }
 
       function pollUpdate() {
