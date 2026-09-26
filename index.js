@@ -9,7 +9,7 @@
 
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { readdirSync, readFileSync, statSync, chmodSync, realpathSync } from 'node:fs'
+import { readFileSync, statSync, chmodSync, realpathSync } from 'node:fs'
 
 export const name = 'usage-stats'
 export const inject = ['webServer']
@@ -36,18 +36,16 @@ const CACHE_TTL_MS = 60000
 const STATUS_FEED_URL = 'https://status.deepseek.com/history.rss'
 const STATUS_PAGE_URL = 'https://status.deepseek.com'
 const STATUS_CHECK_TTL_MS = 5 * 60 * 1000
-// 有告警时的缓存 TTL —— 它就是「恢复后多久消失」的滞后上限，不能和无告警时一样放满 5 分钟。
-// 2026-09-23 实测：15:35 起事故、15:44 官方标 resolved，侧边栏还挂着，手动刷新才消失；
-// 判定逻辑没错（resolved → active:false），是 host 5 分钟 TTL + 客户端 5 分钟轮询叠出来的 ~10 分钟。
-// 只在告警期提速：事故更新本来就是分钟级，正常时仍 5 分钟一轮，不折腾 status.deepseek.com。
+// 有告警时的缓存 TTL —— 它就是「官方已恢复、界面还挂着」的滞后上限：判定本身没问题
+// （resolved → active:false），滞后是 host TTL 与客户端轮询叠加出来的。只在告警期提速：
+// 事故更新本来就是分钟级，正常时仍 5 分钟一轮，不折腾 status.deepseek.com。
 const STATUS_CHECK_TTL_ACTIVE_MS = 30 * 1000
 // 僵尸保护：RSS 卡住或某条一直没写 resolved 时，不要把陈年条目永远挂在界面上
 const STATUS_MAX_AGE_MS = 12 * 60 * 60 * 1000
 // 版本检测（Host 侧）：读取运行中 DSH 的版本（从其 package.json），拉取官方「最新
-// 可装版本」（GitHub Releases 的 tag + npm 的发布 tag），比较后决定是否在品牌行显示
-// 「有新版」。有新版才提示，无新版隐藏。
-// 只看 GitHub Releases 的正式 tag（release candidate 与正式版），**排除 alpha**：
-// alpha 是内部构建、官方下一步往往自己就弃了，不该催用户升（用户 2026-09-23 明确口径）。
+// 可装版本」（npm registry 的 latest / next 两个发布 tag），比较后决定是否在品牌行显示
+// 「有新版」。有新版才提示，无新版隐藏；只提示 release candidate 与正式版，**排除 alpha**
+// （alpha 是内部构建、官方下一步往往自己就弃了，不该催用户升）。
 // 运行中 DSH 的安装根目录：realpath 解掉 bin/dsh 符号链接，避免 dirname(argv[1])/..
 // 落到 nvm 根目录（无 package.json）。解不开则退回字面路径。
 function resolveDshInstallRoot() {
@@ -63,150 +61,96 @@ const DSH_PKG_JSON = join(DSH_INSTALL_ROOT, 'package.json')
 const NPM_DIST_URL = 'https://registry.npmjs.org/@deepseek-ai/dsh'
 // 只取 releases 列表（不需要 release 正文），每页 100 条足够覆盖历史；未认证 60 次/小时
 // 的限额对「1 小时一轮」也绰绰有余。
-const RELEASES_API_URL = 'https://api.github.com/repos/deepseek-ai/deepseek-harness/releases?per_page=100'
 const RELEASES_URL = 'https://github.com/deepseek-ai/deepseek-harness/releases'
 // 发布 tag 形如 `dsh-v0.1.7-rc.1`（仓库里不止 DSH 一个包，tag 带 `dsh-` 前缀）；
 // 兼容去掉前缀的写法（`v0.1.7-rc.1` / `0.1.7-rc.1`），也放过 `dsh-cli-v*` 这类别的包。
-const RELEASE_TAG_RE = /^(?:dsh-)?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/
 const UPDATE_CHECK_TTL_MS = 3600 * 1000 // 1 小时 —— 版本变更极低频，避免频繁打 GitHub / npm
+
+// ---------------------------------------------------------------------------
+// 通用：TTL 缓存（三处快照共用一份实现）
+// ---------------------------------------------------------------------------
+
+/**
+ * TTL 缓存 + in-flight 合并 + 失败不写缓存。
+ *
+ * 三处快照（官方数据、服务状态、版本检测）原本各手写了一份同样的骨架，差别只有三处：
+ * TTL 怎么算、按什么分片、失败时给什么兜底。这个函数把三者都收成参数 ——
+ * **兜底不硬合并**：三处的形状本来就不同（null / idleStatus() / 带 error 的对象），
+ * 强行统一只会把差异藏进条件分支里。
+ *
+ * 失败不写缓存是刻意的：挂了就把上次的成功结果留在原处（它已经过期，下次自然会重抓），
+ * 而不是让一个失败被缓存住、把界面钉在旧状态。
+ *
+ * @param fn - 取数据；抛错即走 onError（或不缓存地抛出）。
+ * @param ttl - 有效期（毫秒），或 `(value) => ms`（按上一次的结果分档，如余额缺失 / 有告警时收紧）。
+ * @param now - 时钟。测试注入假时钟才能量化「多久翻牌」。
+ * @param onError - 失败时的兜底值；省略则把错误抛给调用方。
+ * @returns `async (key = '') => value`，key 用于分片（官方数据按 token 分片）。
+ */
+function cached(fn, { ttl, now = Date.now, onError = null } = {}) {
+  const ttlOf = typeof ttl === 'function' ? ttl : () => ttl
+  const entries = new Map()
+  let inFlight = null
+
+  return async function call(key = '') {
+    const at = now()
+    const hit = entries.get(key)
+    if (hit !== undefined && at - hit.at < ttlOf(hit.value)) return hit.value
+    if (inFlight !== null && inFlight.key === key) return inFlight.promise
+    const promise = (async () => {
+      try {
+        const value = await fn(key)
+        entries.set(key, { at: now(), value })
+        return value
+      } catch (err) {
+        if (onError === null) throw err
+        return onError(err)
+      } finally {
+        if (inFlight !== null && inFlight.key === key) inFlight = null
+      }
+    })()
+    inFlight = { key, promise }
+    return promise
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 官方端点（platform userToken → 私有 dashboard 接口）
 // ---------------------------------------------------------------------------
 
 /**
- * 读取配置文件。返回 `{ token, autoScan }`；`token: null` 表示"配置里没有可用 token"
+ * 读取配置文件。返回 `{ token }`；`token: null` 表示"配置里没有可用 token"
  * （含文件不存在）。返回 `null` 表示**读取/解析失败**——调用方保留上一次生效的配置，
  * 不因为一次 IO 抖动或半写入的 JSON 把已配置的 token 判死（那会误报"请配置 platformToken"）。
  */
 function readConfigFile() {
   let text
   try {
-    // P2：明文 token 文件必须 owner-only；权限过宽则自动收紧到 0600
+    // 明文 token 文件必须 owner-only；权限过宽则自动收紧到 0600
     const st = statSync(TOKEN_FILE)
     if ((st.mode & 0o077) !== 0) chmodSync(TOKEN_FILE, 0o600)
     text = readFileSync(TOKEN_FILE, 'utf8')
   } catch (err) {
     // 文件被删掉 = 用户明确撤销配置；其他 IO 失败不清空
-    if (err && err.code === 'ENOENT') return { token: null, autoScan: false }
+    if (err && err.code === 'ENOENT') return { token: null }
     return null
   }
-  if (!text) return { token: null, autoScan: false }
+  if (!text) return { token: null }
   try {
     const j = JSON.parse(text)
-    const raw = j && (j.platformToken !== undefined ? j.platformToken : (typeof j.value === 'string' ? j.value : null))
-    let token = null
-    if (typeof raw === 'string' && raw.trim()) token = raw.trim()
-    else if (raw !== null && typeof raw === 'object' && typeof raw.value === 'string' && raw.value.trim()) token = raw.value.trim()
-    return { token, autoScan: !!(j && j.autoScan === true) }
+    // 只有一种格式：`{ "platformToken": "..." }`。早期为别的工具兼容留的 `j.value` /
+    // `platformToken.value` 两种写法已删——它们从第一个提交起就在，README 从来只文档化
+    // `platformToken`，没有「已发布格式」的包袱。
+    const raw = j && j.platformToken
+    const token = typeof raw === 'string' && raw.trim() ? raw.trim() : null
+    return { token }
   } catch (err) {
     return null
   }
 }
 
-/**
- * 自动获取：扫描本机 Chromium 系浏览器（Chrome / Edge / Brave / Arc）各 Profile
- * 的 Local Storage LevelDB，提取 platform.deepseek.com 的 userToken 候选。
- * 启发式解析（不引入 LevelDB 依赖）：记录形如 `userToken<len>base64值`，
- * 直接用正则抓取值主体，交给 probeToken 校验。
- */
-const BROWSER_ROOTS = [
-  join(homedir(), 'Library', 'Application Support', 'Google', 'Chrome'),
-  join(homedir(), 'Library', 'Application Support', 'Microsoft Edge'),
-  join(homedir(), 'Library', 'Application Support', 'BraveSoftware', 'Brave-Browser'),
-  join(homedir(), 'Library', 'Application Support', 'Arc'),
-]
-const BROWSER_SCAN_MAX_BYTES = 64 * 1024 * 1024 // 单文件上限 64MB
-// DeepSeek userToken 长度区间（实测 64/66 字符；放宽范围以防变化）。
-// localStorage 值形如 {"value":"...","__version":"0"}，token 主体是 base64 运行。
-const TOKEN_LEN_MIN = 55
-const TOKEN_LEN_MAX = 85
-const MAX_CANDIDATES = 40 // 候选上限：约束"无有效 token"时逐候选校验的成本
-
-/** 从一段文本里提取一个 base64 token 候选（优先解析 JSON `{"value":"..."}`，兜底裸 base64）。 */
-function tokenCandidateFrom (segment) {
-  const jm = segment.match(/"value"\s*:\s*"([A-Za-z0-9+/=]{40,200})"/)
-  if (jm) return jm[1]
-  const rm = segment.match(/[A-Za-z0-9+/=]{40,200}/)
-  return rm ? rm[0] : null
-}
-
-/** 在文本中查找 marker（userToken key / deepseek origin / "value":" JSON）邻近的候选。 */
-function extractNearMarkers (text) {
-  const out = []
-  const seen = new Set()
-  const add = (v) => { if (v && !seen.has(v)) { seen.add(v); out.push(v) } }
-  for (const needle of ['userToken', 'platform.deepseek.com', '"value":"']) {
-    let idx = 0
-    while ((idx = text.indexOf(needle, idx)) !== -1) {
-      const candidate = tokenCandidateFrom(text.slice(idx, idx + 400))
-      if (candidate) add(candidate)
-      idx += needle.length
-    }
-  }
-  return out
-}
-
-function scanBrowserTokens () {
-  // primary：含 platform.deepseek.com origin 的文件里的合理长度候选——最可靠，
-  // 实测能命中有效 token 并天然排除其他网站/旧记录的 token。
-  const primary = []
-  const primarySeen = new Set()
-  // fallback：marker 邻近候选（覆盖 key/value 跨 SSTable 且文件缺 origin 的场景）
-  const fallback = []
-  const fallbackSeen = new Set()
-  for (const root of BROWSER_ROOTS) {
-    let profiles = []
-    try {
-      profiles = readdirSync(root)
-    } catch (err) {
-      continue
-    }
-    for (const profile of profiles) {
-      if (profile === 'Local State') continue
-      let files = []
-      try {
-        files = readdirSync(join(root, profile, 'Local Storage', 'leveldb'))
-      } catch (err) {
-        continue
-      }
-      for (const file of files) {
-        if (!file.endsWith('.ldb') && !file.endsWith('.log')) continue
-        const path = join(root, profile, 'Local Storage', 'leveldb', file)
-        let buf
-        try {
-          const stat = readFileSync(path)
-          if (stat.length > BROWSER_SCAN_MAX_BYTES) continue
-          buf = stat
-        } catch (err) {
-          continue
-        }
-        const text = buf.toString('latin1')
-        const hasOrigin = text.includes('platform.deepseek.com')
-        // 独立 base64 运行：用 {40,200} 取完整运行（避免长二进制子串的假阳性），再按长度收敛。
-        // 只在含 deepseek origin 的文件里收（排除其他网站/旧记录的 token 假阳性）。
-        const re = /[A-Za-z0-9+/=]{40,200}/g
-        let m
-        while ((m = re.exec(text)) !== null) {
-          const len = m[0].length
-          if (len < TOKEN_LEN_MIN || len > TOKEN_LEN_MAX) continue
-          if (hasOrigin && !primarySeen.has(m[0])) { primarySeen.add(m[0]); primary.push(m[0]) }
-        }
-        // marker 邻近候选兜底（key / origin / JSON）
-        for (const v of extractNearMarkers(text)) {
-          if (v && !primarySeen.has(v) && !fallbackSeen.has(v)) { fallbackSeen.add(v); fallback.push(v) }
-        }
-      }
-    }
-  }
-  // primary 按长度接近 65 排序（实测 token 64/66），让最可能先被校验
-  primary.sort((a, b) => Math.abs(a.length - 65) - Math.abs(b.length - 65))
-  // 限制候选总量：正常情况有效 token 位于前段；同时约束"无有效 token"时的校验成本
-  return [...primary, ...fallback].slice(0, MAX_CANDIDATES)
-}
-
 function isAuthError(payload) {
-  // P2-3：HTTP 401/403（fetchJson 标记的 __authError）与平台业务码 40002/40003
+  // HTTP 401/403（fetchJson 标记的 __authError）与平台业务码 40002/40003
   if (payload && payload.__authError) return true
   const code = payload && payload.code
   const bizCode = payload && payload.data && payload.data.biz_code
@@ -220,138 +164,63 @@ function isAuthHttpResponse(response) {
   return String(response.headers.get('content-type') || '').includes('json')
 }
 
-/**
- * 探测 token：`'valid' | 'invalid' | 'unknown'`。
- * 只有平台**明确拒绝**（业务码 40002/40003、或带 JSON 体的 401/403）才是 `'invalid'`；
- * 网络错误、超时、限流 429、5xx、WAF 拦截页一律 `'unknown'`——一次请求失败不能证明
- * token 无效，据此把用户配置好的 token 丢掉会误报"请配置有效的 platformToken"。
- */
-async function probeToken(token) {
-  try {
-    const response = await fetch(`${PLATFORM_BASE}/api/v0/users/get_user_summary`, {
-      headers: { ...OFFICIAL_HEADERS, Authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(8000),
-    })
-    if (!response.ok) return isAuthHttpResponse(response) ? 'invalid' : 'unknown'
-    const j = await response.json()
-    if (j && j.code === 0) return 'valid'
-    return isAuthError(j) ? 'invalid' : 'unknown'
-  } catch (err) {
-    return 'unknown'
-  }
-}
-
-// token 解析状态：手动配置优先。
-// P1：浏览器自动扫描为显式 opt-in —— 需配置文件里 `"autoScan": true`，
-// 默认关闭，避免把其他网站的 userToken 形式字符串发往 DeepSeek 验证。
-// userToken 是长效会话（数周~数月），只在登录/登出/改密时变化：
-// 配置文件用 stat 变更检测（每次查询前），浏览器扫描 6 小时一次 + 失效强制。
-const BROWSER_SCAN_MS = 6 * 60 * 60 * 1000
-// 手动 token 被平台**明确拒绝**后的冷却：期间改走浏览器候选，冷却期满自动再试一次。
-// 关键是"明确拒绝"才进入冷却——超时/429/WAF 拦页不算，不能把配置好的 token 判死。
+// 手动 token 被平台**明确拒绝**后的冷却：期间不发请求（背压），期满自动再试一次。
+// 关键是只有"明确拒绝"才进冷却——超时 / 429 / WAF 拦页不算，不能把配置好的 token 判死。
 const MANUAL_RETRY_MS = 10 * 60 * 1000
-// 浏览器候选全部"没问到"（unknown）时的重试间隔：不能把一次断网/限流记成"没有 token"
-const SCAN_RETRY_MS = 5 * 60 * 1000
 
-const tokenState = {
-  manual: null,           // 配置文件读到的 token（只由配置文件决定，不因请求结果丢弃）
-  manualRejectedAt: null, // 平台明确拒绝该 token 的时间（null = 没被拒过）
-  autoScan: false,        // 是否启用浏览器自动扫描（opt-in）
-  configCheckedAt: 0,     // 上次重读配置文件时间
-  scanCheckedAt: 0,       // 上次扫描浏览器时间
-  exhaustedAt: null,      // 上次全量校验候选的时间（避免每次查询重复校验）
-  exhaustedTransient: false, // 上次穷尽是否只是因为"没问到"（true 则用 SCAN_RETRY_MS 重试）
-  candidates: [],          // 浏览器扫描到的候选
-  browserValid: null,      // 已验证有效的浏览器 token
-  configGeneration: 0,     // 配置每变化一次 +1，官方缓存据此失效
-}
+/**
+ * token 解析器：手动配置优先，**不做前置探测**。
+ *
+ * 为什么不做前置探测：token 是否有效由真实数据请求判定（`fetchOfficial` 的 auth 分支）。
+ * 前置探测会把 429 / 超时 / WAF 拦截页误当"token 无效"，丢掉配置好的有效 token，界面随之
+ * 误报"请配置有效的 platformToken"——2026-09-19 修的就是这个。
+ *
+ * 每次 `resolve()` 都**直接读配置**：文件几十字节、一次查询一次，成本可忽略。所以
+ * 「改文件即生效」不需要 stat 签名、也不需要 TTL 兜底重读——以前那套（inode+mtime+size
+ * 签名 + 5 分钟 TTL + configGeneration）是为了省一次 readFileSync，省得不成比例。
+ *
+ * 工厂形态是为了给测试留缝：注入 `readConfig` 与 `now`，就能用假配置 + 假时钟把
+ * 「不做前置探测 / 冷却窗口 / 换 token 立刻复位 / IO 抖动沿用上次 token / ENOENT 撤销」
+ * 这几条边界钉住（见 `Scripts/test-token-resolver.mjs`）。这条路径此前没有任何自动化测试，
+ * 而它是本仓历史上最严重误报的出处。
+ *
+ * @param readConfig - 读配置：`{ token }` / `{ token: null }`（明确无 token）/ `null`（读失败）。
+ * @param now - 时钟。
+ * @param retryMs - 被明确拒绝后的冷却时长。
+ */
+function createTokenResolver({
+  readConfig = readConfigFile,
+  now = Date.now,
+  retryMs = MANUAL_RETRY_MS,
+} = {}) {
+  let manual = null          // 配置文件读到的 token（只由配置文件决定，不因请求结果丢弃）
+  let lastRejectedAt = null  // 平台明确拒绝该 token 的时间（null = 没被拒过）
 
-/** 配置文件的 inode+mtime+size 签名；每次官方查询前轻量检测。 */
-let lastConfigSig = null
-function configFileChanged() {
-  let st = null
-  try {
-    st = statSync(TOKEN_FILE)
-  } catch (err) {
-    // 文件不存在也算一种状态
-  }
-  const sig = st === null ? 'missing' : `${st.ino}:${st.mtimeMs}:${st.size}`
-  const changed = sig !== lastConfigSig
-  lastConfigSig = sig
-  return changed
-}
-
-/** 应用一次配置读取：token / autoScan 变化时重置对应状态并 bump 代数。 */
-function applyConfig(cfg) {
-  // 读不到配置（IO 抖动 / 半写入的 JSON）时保留上一次生效的配置
-  if (cfg === null) return
-  const newManual = cfg.token
-  if (newManual !== tokenState.manual) {
-    tokenState.manual = newManual
-    tokenState.manualRejectedAt = null // 换了 token，重新给一次机会
-    tokenState.configGeneration += 1
-  }
-  const newAutoScan = cfg.autoScan
-  if (newAutoScan !== tokenState.autoScan) {
-    tokenState.autoScan = newAutoScan
-    tokenState.configGeneration += 1
-    if (!newAutoScan) {
-      // 撤销 opt-in 立即清空浏览器 token 与候选，不能继续使用
-      tokenState.browserValid = null
-      tokenState.candidates = []
-    } else {
-      tokenState.scanCheckedAt = 0 // 开启后立即扫描
-    }
-  }
-}
-
-async function resolveToken(forceRescan = false) {
-  const now = Date.now()
-  if (forceRescan || configFileChanged() || now - tokenState.configCheckedAt > 5 * 60 * 1000) {
-    tokenState.configCheckedAt = now
-    applyConfig(readConfigFile())
-  }
-  // 浏览器扫描：重量操作，低频（6h）+ 鉴权失败强制；仅 opt-in
-  if (forceRescan || now - tokenState.scanCheckedAt > BROWSER_SCAN_MS) {
-    tokenState.scanCheckedAt = now
-    tokenState.candidates = tokenState.autoScan ? scanBrowserTokens() : []
-    // P2：候选集刷新后必须淘汰旧 browserValid——用户切换账号后不再沿用旧 token
-    tokenState.browserValid = null
-    tokenState.exhaustedAt = null // 新候选集，重置"无有效 token"记忆
-  }
-  // 1) 手动配置优先：**不做前置探测，直接使用**——token 是否有效由真实数据请求判定
-  //    （fetchOfficial 的 auth 分支）。前置探测把 429/超时/WAF 拦截页误当"token 无效"，
-  //    会丢掉配置好的有效 token，界面随之误报"请配置有效的 platformToken"。
-  //    只有被平台明确拒绝后才进入冷却，冷却期改走浏览器候选，期满自动再试。
-  if (tokenState.manual !== null) {
-    const cooling = tokenState.manualRejectedAt !== null && now - tokenState.manualRejectedAt < MANUAL_RETRY_MS
-    if (!cooling) {
-      tokenState.manualRejectedAt = null
-      return tokenState.manual
-    }
-  }
-  // 2) 浏览器自动获取：优先复用已验证的，否则逐候选校验
-  if (tokenState.browserValid !== null) return tokenState.browserValid
-  // 已全量校验过且无有效 token：在下次扫描前不再重复校验，避免每次查询都校验全部候选。
-  // 但"没问到"（unknown）只是暂时的——用更短的窗口重试，别把断网记成"没有 token"。
-  const retryWindow = tokenState.exhaustedTransient ? SCAN_RETRY_MS : BROWSER_SCAN_MS
-  if (forceRescan || tokenState.exhaustedAt === null || now - tokenState.exhaustedAt > retryWindow) {
-    let sawUnknown = false
-    for (const candidate of tokenState.candidates) {
-      const verdict = await probeToken(candidate)
-      if (verdict === 'valid') {
-        tokenState.browserValid = candidate
-        tokenState.exhaustedAt = null
-        tokenState.exhaustedTransient = false
-        return candidate
+  return {
+    /** 当前该用的 token；`null` = 没有可用 token 或正在冷却。 */
+    resolve() {
+      const cfg = readConfig()
+      // 读不到配置（IO 抖动 / 半写入的 JSON）时保留上一次生效的配置
+      if (cfg !== null && cfg.token !== manual) {
+        manual = cfg.token
+        lastRejectedAt = null // 换了 token，重新给一次机会
       }
-      if (verdict === 'unknown') sawUnknown = true
-    }
-    tokenState.exhaustedAt = now
-    tokenState.exhaustedTransient = sawUnknown
+      const at = now()
+      const cooling = lastRejectedAt !== null && at - lastRejectedAt < retryMs
+      if (manual !== null && !cooling) {
+        lastRejectedAt = null
+        return manual
+      }
+      return null
+    },
+    /** 平台**明确拒绝**当前 token 时记账；瞬时失败不要调（那会把有效 token 判死）。 */
+    noteRejected() { lastRejectedAt = now() },
+    hasToken: () => manual !== null,
+    isRejected: () => lastRejectedAt !== null,
   }
-  return null
 }
+
+const tokenResolver = createTokenResolver()
 
 async function fetchJson(path, token, signal) {
   const response = await fetch(`${PLATFORM_BASE}${path}`, {
@@ -359,8 +228,8 @@ async function fetchJson(path, token, signal) {
     signal,
   })
   if (!response.ok) {
-    // P2-3：平台以 JSON 体的 401/403 拒绝 = token 失效，交给 isAuthError 触发重扫，
-    // 而不是直接抛错绕过鉴权重试逻辑。注意 WAF 拦截页也用 403/429 但返回 text/html，
+    // 平台以 JSON 体的 401/403 拒绝 = token 失效，标成 __authError 让 isAuthError 认出来
+    // （而不是直接抛错绕过鉴权判定）。注意 WAF 拦截页也用 403/429 但返回 text/html，
     // 那是"没问到"，不能当成 token 失效（否则界面会误报"请配置有效的 platformToken"）。
     if (isAuthHttpResponse(response)) {
       return { __authError: true, __status: response.status }
@@ -372,27 +241,20 @@ async function fetchJson(path, token, signal) {
 
 function sumUsage(items) {
   let tokens = 0
-  let requests = 0
   for (const item of items || []) {
     if (typeof item !== 'object' || item === null) continue
     const type = String(item.type || '').toUpperCase()
     const amount = Number(item.amount)
     if (!Number.isFinite(amount)) continue
-    if (type === 'REQUEST') requests += amount
-    else if (type === 'PROMPT_CACHE_HIT_TOKEN' || type === 'PROMPT_CACHE_MISS_TOKEN' || type === 'RESPONSE_TOKEN') tokens += amount
+    if (type === 'PROMPT_CACHE_HIT_TOKEN' || type === 'PROMPT_CACHE_MISS_TOKEN' || type === 'RESPONSE_TOKEN') tokens += amount
   }
-  return { tokens, requests }
+  return tokens
 }
 
 function sumModels(modelUsages) {
   let tokens = 0
-  let requests = 0
-  for (const mu of modelUsages || []) {
-    const s = sumUsage(mu && mu.usage)
-    tokens += s.tokens
-    requests += s.requests
-  }
-  return { tokens, requests }
+  for (const mu of modelUsages || []) tokens += sumUsage(mu && mu.usage)
+  return tokens
 }
 
 /** 北京时间今日 00:00 的 epoch 秒。 */
@@ -402,18 +264,16 @@ function beijingTodayStartSec() {
   return Math.floor(startMs / 1000)
 }
 
-/** 对 by_api_key/amount 的 biz_data 求和 tokens/requests（小时桶，实时准确）。 */
+/** 对 by_api_key/amount 的 biz_data 求和 tokens（小时桶，实时准确）。 */
 function sumByApiKeyAmount(biz) {
   let tokens = 0
-  let requests = 0
   for (const s of biz.series || []) {
     for (const b of s.buckets || []) {
       const u = b.usage || {}
       tokens += (u.PROMPT_CACHE_HIT_TOKEN || 0) + (u.PROMPT_CACHE_MISS_TOKEN || 0) + (u.RESPONSE_TOKEN || 0)
-      requests += (u.REQUEST || 0)
     }
   }
-  return { tokens, requests }
+  return tokens
 }
 
 /** 对 by_api_key/cost 的 biz_data 求和 cost（小时桶，实时准确）。 */
@@ -439,36 +299,23 @@ function parseOfficialPayload(amountRes, costRes, summaryRes, byKeyAmount, byKey
   }
   const currency = (costBiz && costBiz[0] && costBiz[0].currency) || 'CNY'
 
-  const dayMap = new Map()
+  // 本月：用官方按天接口的「本月」口径（今天按 0 滞后计，所以下面用 by_api_key 覆盖今日、不叠加进本月）
   let monthTokens = 0
-  let monthRequests = 0
-  let monthCost = 0
   for (const day of amountBiz.days || []) {
     if (typeof day !== 'object' || day === null || !day.date) continue
-    const s = sumModels(day.data)
-    dayMap.set(day.date, s)
-    monthTokens += s.tokens
-    monthRequests += s.requests
+    monthTokens += sumModels(day.data)
   }
-  const costDayMap = new Map()
+  let monthCost = 0
   for (const day of (costBiz && costBiz[0] && costBiz[0].days) || []) {
     if (typeof day !== 'object' || day === null || !day.date) continue
-    const s = sumModels(day.data)
-    costDayMap.set(day.date, s)
-    monthCost += s.tokens
+    monthCost += sumModels(day.data)
   }
 
-  // 今日真实用量：by_api_key 按小时（实时准确）。按天接口今日滞后=0，故用 by_api_key 覆盖今日，
-  // 本月仍用按天接口值（官方「本月」口径，今天按 0 滞后计，不重复叠加今日）。
+  // 今日真实用量：by_api_key 按小时（实时准确），覆盖按天接口的今日值
   let liveTodayTokens = 0
-  let liveTodayRequests = 0
   let liveTodayCost = 0
   const keyAmountBiz = byKeyAmount && byKeyAmount.data && byKeyAmount.data.biz_data
-  if (keyAmountBiz) {
-    const s = sumByApiKeyAmount(keyAmountBiz)
-    liveTodayTokens = s.tokens
-    liveTodayRequests = s.requests
-  }
+  if (keyAmountBiz) liveTodayTokens = sumByApiKeyAmount(keyAmountBiz)
   const keyCostBiz = byKeyCost && byKeyCost.data && byKeyCost.data.biz_data
   if (keyCostBiz) liveTodayCost = sumByApiKeyCost(keyCostBiz)
 
@@ -486,18 +333,19 @@ function parseOfficialPayload(amountRes, costRes, summaryRes, byKeyAmount, byKey
   }
 
   return {
-    today: { tokens: liveTodayTokens, cost: liveTodayCost, requests: liveTodayRequests },
-    // 本月用按天接口值（官方页「本月」口径，今天按 0 滞后计）。不要把今日再叠加进本月——会重复。
-    month: { tokens: monthTokens, cost: monthCost, requests: monthRequests },
+    today: { tokens: liveTodayTokens, cost: liveTodayCost },
+    month: { tokens: monthTokens, cost: monthCost },
     currency,
     balance,
   }
 }
 
-async function fetchOfficial() {
-  const token = await resolveToken()
-  if (!token) return null
-  // P1：月份按北京时间计算，避免每月 1 日 00:00–07:59（UTC 仍在上一月）查错月份
+/**
+ * 拉一次官方用量。token 由调用方（`officialSnapshot`）从解析器取好传进来——
+ * 这样缓存与 in-flight 都能以同一个 token 为 key，不必再靠 configGeneration 失效。
+ */
+async function fetchOfficial(token) {
+  // 月份按北京时间计算，避免每月 1 日 00:00–07:59（UTC 仍在上一月）查错月份
   const shifted = new Date(Date.now() + BEIJING_OFFSET_MS)
   const month = shifted.getUTCMonth() + 1
   const year = shifted.getUTCFullYear()
@@ -508,7 +356,7 @@ async function fetchOfficial() {
 
   const fetchBatch = (t) => {
     const signal = AbortSignal.timeout(15000)
-    // P3：单请求失败不整体抛错——转成标记，避免 5xx 并发时掩盖同批的
+    // 单请求失败不整体抛错——转成标记，避免 5xx 并发时掩盖同批的
     // 401/403 认证失败（__authError 仍需触发重扫）
     const wrap = (p) => p.catch((err) => ({ __httpError: String(err && err.message ? err.message : err) }))
     return Promise.all([
@@ -520,22 +368,11 @@ async function fetchOfficial() {
     ])
   }
 
-  let [amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(token)
-  if ([amountRes, costRes, summaryRes, byKeyAmount, byKeyCost].some(isAuthError)) {
-    // token 被平台明确拒绝：记下拒绝时间（**不丢掉配置里的 token**），强制重扫
-    // （配置重读 + 浏览器重扫），冷却期内 resolveToken 会改用浏览器候选，用新 token 重试一次
-    if (token === tokenState.manual) tokenState.manualRejectedAt = Date.now()
-    else tokenState.browserValid = null
-    tokenState.configCheckedAt = 0
-    tokenState.scanCheckedAt = 0
-    const retried = await resolveToken(true)
-    if (retried === null) throw new Error('platform token rejected and no fresh candidate')
-    ;[amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(retried)
-    if ([amountRes, costRes, summaryRes, byKeyAmount, byKeyCost].some(isAuthError)) {
-      if (retried === tokenState.manual) tokenState.manualRejectedAt = Date.now()
-      else tokenState.browserValid = null
-    }
-  }
+  const [amountRes, costRes, summaryRes, byKeyAmount, byKeyCost] = await fetchBatch(token)
+  // token 被平台**明确拒绝**：记下拒绝时间（**不丢掉配置里的 token**），此后冷却期内不再发请求。
+  // 只有"明确拒绝"才记账——超时 / 429 / WAF 拦页走的是 unknown，绝不能把有效 token 判死。
+  // 记账与判定必须都在：只 throw 不记账的话，界面就分不清「已被平台拒绝」和「暂时拿不到数据」。
+  if ([amountRes, costRes, summaryRes, byKeyAmount, byKeyCost].some(isAuthError)) tokenResolver.noteRejected()
   return parseOfficialPayload(amountRes, costRes, summaryRes, byKeyAmount, byKeyCost)
 }
 
@@ -596,8 +433,8 @@ function installedDshVersion() {
 }
 
 // npm registry 的发布 tag（仅 GET，无副作用）：`next` 是预发布通道的指针，rc 版本
-// 常常先挂在这里，而 `latest` 要等它转正才动。两个 tag 都留着 —— GitHub Releases、
-// npm `next`、npm `latest` 任何一处出现更新都要能报出来。
+// 常常先挂在这里，而 `latest` 要等它转正才动。两个 tag 都要看 —— 只看 `latest` 会让
+// 跑 rc 的用户永远检测不到新版（2026-09-23 就是这个漏报）。
 async function fetchNpmDistTags() {
   const response = await fetch(NPM_DIST_URL, {
     headers: { Accept: 'application/json', 'User-Agent': UA },
@@ -610,132 +447,54 @@ async function fetchNpmDistTags() {
   return tags
 }
 
-// GitHub Releases：只认正式发布的 tag（rc 与正式版），**排除 alpha**（用户口径）。
-// 返回其中最高的版本号；一个可用的都没有（全 alpha / 空列表）返回 null —— 不是错误，
-// 而是「没有值得提示的可装版本」。
-async function fetchReleaseVersions() {
-  const response = await fetch(RELEASES_API_URL, {
-    headers: { Accept: 'application/vnd.github+json', 'User-Agent': UA },
-    signal: AbortSignal.timeout(15000),
-  })
-  if (!response.ok) throw new Error(`github releases ${response.status}`)
-  const json = await response.json()
-  if (!Array.isArray(json)) throw new Error('github releases: unexpected payload')
-  return highestReleaseVersion(json.map((release) => (release && typeof release.tag_name === 'string' ? release.tag_name : '')))
-}
-
-// 每个来源一个独立备忘：某一源挂了（GitHub 限流、npm 抖动）不该把另一源的结果一起作废。
-// 只记成功结果；空结果也记（「当前没有 rc/正式版」是事实，1 小时内不会变）。
-function memoize(fn, ttlMs, now = Date.now) {
-  let cache = null
-  let inFlight = null
-  return async function call() {
-    const at = now()
-    if (cache !== null && at - cache.at < ttlMs) return cache.value
-    if (inFlight !== null) return inFlight
-    const promise = (async () => {
-      try {
-        const value = await fn()
-        cache = { at: now(), value }
-        return value
-      } finally {
-        inFlight = null
-      }
-    })()
-    inFlight = promise
-    return promise
-  }
-}
-
-// tag → 版本号；不是本仓 DSH 的发布 tag（或解析不出）返回 null，直接忽略。
-function releaseTagToVersion(tag) {
-  const m = RELEASE_TAG_RE.exec(String(tag).trim())
-  if (m === null) return null
-  const version = m[1]
-  return isAlphaVersion(version) ? null : version
-}
-
 // alpha 是内部构建，不催用户升（见文件头版本检测注释）。
 function isAlphaVersion(version) {
   const parsed = parseVersion(version)
   return parsed !== null && parsed.prerelease.includes('alpha')
 }
 
-// 从一堆发布 tag 里挑出最高的可提示版本；全都不可用则 null。
-function highestReleaseVersion(tags) {
-  let best = null
-  for (const tag of tags) {
-    const version = releaseTagToVersion(tag)
-    if (version === null) continue
-    if (best === null || compareVersions(version, best) > 0) best = version
-  }
-  return best
-}
-
-// 「最新可装版本」= GitHub Releases（rc/正式）与 npm 两个发布 tag 里最高的那个。
+// 「最新可装版本」= npm 的 `latest` 与 `next` 里较高的那个（排除 alpha）。
+//
+// 为什么只看 npm：npm 的版本集合是 GitHub Releases 的**超集** —— 实测 2026-09-26
+// 有 27 个版本，其中 `0.1.5-rc.3` 只在 npm 上（GitHub Releases 没有），而排除 alpha 后
+// 两边最高版一致。所以看不出 GitHub 能多给什么，少一个源就少一份限流/抖动的可能。
+//
 // rc 的版本号本身带 `-rc.N`，compareVersions 已经把预发布段算进去（正式版 > 同号 rc，
-// rc.2 > rc.1），所以这里不用再区分通道，只取最大值。全部来源都失败时抛错 → 不缓存、下次重试。
-async function fetchLatestDshVersion(deps) {
-  const { npmDistTags, releaseVersions } = deps
-  const attempts = [
-    async () => releaseVersions(),
-    async () => (await npmDistTags()).latest,
-    async () => (await npmDistTags()).next,
-  ]
-  const values = await Promise.allSettled(attempts.map((attempt) => attempt()))
+// rc.2 > rc.1），所以不用区分通道，只取最大值。npm 挂了就抛错 → 不缓存、下次重试；
+// 「没有可提示的版本」（全 alpha / 空）返回 null —— 那不是错误。
+async function fetchLatestDshVersion({ npmDistTags = fetchNpmDistTags } = {}) {
+  const tags = await npmDistTags()
   let best = null
-  let ok = 0
-  for (const settled of values) {
-    if (settled.status !== 'fulfilled') continue
-    ok += 1
-    const value = settled.value
+  for (const value of [tags.latest, tags.next]) {
     if (typeof value !== 'string' || parseVersion(value) === null) continue
+    if (isAlphaVersion(value)) continue // alpha 是内部构建，不催用户升（用户口径）
     if (best === null || compareVersions(value, best) > 0) best = value
   }
-  if (ok === 0) throw new Error('all version sources failed')
   return best
 }
 
-// 版本检测快照：TTL 1 小时（版本变更极低频）、in-flight 合并，失败不毒化缓存（下次重试）。
-// 工厂形态是为了给测试留缝：注入 now / fetchLatest 就能用假时钟与假来源验证「取哪个版本、
-// 什么时候复用缓存、alpha 被排除」（见 Scripts/test-update-check.mjs）。
-function createUpdateSnapshot({ fetchLatest, installed = installedDshVersion, now = Date.now, ttlMs = UPDATE_CHECK_TTL_MS } = {}) {
-  let cache = null
-  let inFlight = null
-  return async function snapshot() {
-    const at = now()
-    if (cache !== null && at - cache.at < ttlMs) return cache.data
-    if (inFlight !== null) return inFlight
-    const promise = (async () => {
-      try {
-        const current = installed()
-        const latest = await fetchLatest()
-        const data = {
-          hasUpdate: current !== null && latest !== null && compareVersions(latest, current) > 0,
-          installed: current,
-          latest,
-          url: RELEASES_URL,
-        }
-        cache = { at: now(), data }
-        return data
-      } catch (err) {
-        cache = null
-        return { hasUpdate: false, installed: installed(), latest: null, url: RELEASES_URL, error: String(err) }
-      } finally {
-        inFlight = null
-      }
-    })()
-    inFlight = promise
-    return promise
+/** 「有新版」快照的组装（纯函数，便于直接断言口径）。 */
+function updateInfo(current, latest) {
+  return {
+    hasUpdate: current !== null && latest !== null && compareVersions(latest, current) > 0,
+    installed: current,
+    latest,
+    url: RELEASES_URL,
   }
 }
 
-const updateSnapshot = createUpdateSnapshot({
-  fetchLatest: () => fetchLatestDshVersion({
-    npmDistTags: memoize(fetchNpmDistTags, UPDATE_CHECK_TTL_MS),
-    releaseVersions: memoize(fetchReleaseVersions, UPDATE_CHECK_TTL_MS),
-  }),
-})
+// 版本检测快照：1 小时缓存（版本变更极低频）。失败给带 error 的对象 —— **形状与另外两处
+// 不同**（那两处是 null / idleStatus()），所以兜底留给这里，缓存机制在 cached() 里。
+// 工厂形态只为给测试留缝（假 fetchLatest + 假时钟）。
+function createUpdateSnapshot({ fetchLatest = fetchLatestDshVersion, installed = installedDshVersion, now = Date.now } = {}) {
+  return cached(async () => updateInfo(installed(), await fetchLatest()), {
+    ttl: UPDATE_CHECK_TTL_MS,
+    now,
+    onError: (err) => ({ hasUpdate: false, installed: installed(), latest: null, url: RELEASES_URL, error: String(err) }),
+  })
+}
+
+const updateSnapshot = createUpdateSnapshot()
 
 // ---------------------------------------------------------------------------
 // DeepSeek 服务状态（status.deepseek.com）
@@ -841,33 +600,9 @@ function evaluateStatusItem(item, now) {
 }
 
 // 状态快照：TTL 取决于上一份快照是不是「有告警」——有告警时盯恢复要快（30s），无告警时
-// 保持 5 分钟一轮。in-flight 合并；失败不缓存（问不到 ≠ 出问题，下次轮询重试）。
-// 工厂形态是为了给缓存策略留可测的缝：注入 now / fetchSnapshot 就能用假时钟量化「恢复滞后」，
-// 直接调下面的单例只能测判定、测不到多久翻牌（见 Scripts/test-status-recovery.mjs）。
-function createStatusSnapshot({ fetchSnapshot, now = Date.now, ttlIdle = STATUS_CHECK_TTL_MS, ttlActive = STATUS_CHECK_TTL_ACTIVE_MS }) {
-  let cache = null
-  let inFlight = null
-  const ttlFor = (data) => (data !== null && data.active === true ? ttlActive : ttlIdle)
-  return async function snapshot() {
-    const at = now()
-    if (cache !== null && at - cache.at < ttlFor(cache.data)) return cache.data
-    if (inFlight !== null) return inFlight
-    const promise = (async () => {
-      try {
-        const data = await fetchSnapshot()
-        cache = { at: now(), data }
-        return data
-      } catch {
-        cache = null
-        return idleStatus()
-      } finally {
-        inFlight = null
-      }
-    })()
-    inFlight = promise
-    return promise
-  }
-}
+// 保持 5 分钟一轮。缓存机制（TTL + in-flight + 失败不缓存）在 cached() 里。
+/** 服务状态的 TTL 分档：有告警时收紧（恢复要尽快翻牌），无告警时 5 分钟内不折腾 status 站。 */
+const statusTtlOf = (data) => (data.active === true ? STATUS_CHECK_TTL_ACTIVE_MS : STATUS_CHECK_TTL_MS)
 
 async function fetchStatusSnapshot() {
   const response = await fetch(STATUS_FEED_URL, {
@@ -880,208 +615,137 @@ async function fetchStatusSnapshot() {
   return evaluateStatusItem(item, Date.now())
 }
 
-const statusSnapshot = createStatusSnapshot({ fetchSnapshot: fetchStatusSnapshot })
+// 服务状态快照。抓不到就按「问不到 ≠ 出问题」返回空闲 —— 兜底形状与另外两处不同。
+// 工厂形态只为给测试留缝（假 fetchSnapshot + 假时钟量化恢复滞后），缓存机制在 cached() 里。
+function createStatusSnapshot({ fetchSnapshot = fetchStatusSnapshot, now = Date.now } = {}) {
+  return cached(fetchSnapshot, { ttl: statusTtlOf, now, onError: () => idleStatus() })
+}
+
+const statusSnapshot = createStatusSnapshot()
 
 // ---------------------------------------------------------------------------
 // 插件主体
 // ---------------------------------------------------------------------------
 
 export async function apply(ctx) {
-  // 官方数据缓存 + in-flight 合并 + 配置变更失效。
-  // balance 缺失（get_user_summary 偶发失败）时用短 TTL，快速重试而非毒化缓存。
-  let officialCache = null
-  let officialInFlight = null
+  // 余额接口偶发失败时用短 TTL 快速重试，别让缺失的余额撑满一个常规周期
   const BALANCE_WEAK_TTL_MS = 10_000
 
-  async function officialSnapshot() {
-    // P1：每次查询前轻量检测配置文件变更（stat），变更立即应用配置、
-    // 清空 token 状态、官方缓存与 in-flight——撤销 token / autoScan 即时生效。
-    if (configFileChanged()) {
-      tokenState.configCheckedAt = 0
-      tokenState.scanCheckedAt = 0
-      applyConfig(readConfigFile())
-      officialCache = null
-      officialInFlight = null // 旧 token 的在途请求不再复用（其结果按 gen 校验丢弃）
-    }
-    const gen = tokenState.configGeneration
-    if (officialCache !== null
-      && officialCache.generation === gen
-      && Date.now() - officialCache.at < (officialCache.weak ? BALANCE_WEAK_TTL_MS : CACHE_TTL_MS)) {
-      return officialCache.data
-    }
-    // P1：in-flight 绑定 generation——配置已变则不复用旧 token 的请求
-    if (officialInFlight !== null) {
-      if (officialInFlight.gen === gen) return officialInFlight.promise
-      officialInFlight = null
-    }
-    const promise = (async () => {
-      try {
-        const data = await fetchOfficial()
-        // P1：完成时若配置代数已变，丢弃旧账号数据，不写缓存
-        if (tokenState.configGeneration !== gen) return null
-        if (data === null) return null
-        if (data.balance === null) {
-          // 余额接口偶发失败：不静默——记日志 + 短 TTL 快速重试
-          ctx.logger.warn('usage-stats: balance unavailable (get_user_summary failed); will retry shortly')
-        }
-        officialCache = { at: Date.now(), data, generation: gen, weak: data.balance === null }
-        return data
-      } catch (err) {
-        officialCache = null
-        return null
-      } finally {
-        if (officialInFlight !== null && officialInFlight.gen === gen) officialInFlight = null
+  // 官方数据：按 token 分片（token 一换缓存自然失效），余额缺失时用短 TTL 快速重试。
+  // 失败兜底是 null（形状与状态/版本两处不同），缓存机制在 cached() 里。
+  const officialCached = cached(
+    async (token) => {
+      const data = await fetchOfficial(token)
+      if (data.balance === null) {
+        // 余额接口偶发失败：不静默——记日志 + 短 TTL 快速重试
+        ctx.logger.warn('usage-stats: balance unavailable (get_user_summary failed); will retry shortly')
       }
-    })()
-    officialInFlight = { gen, promise }
-    return promise
+      return data
+    },
+    {
+      ttl: (data) => (data.balance === null ? BALANCE_WEAK_TTL_MS : CACHE_TTL_MS),
+      onError: () => null,
+    },
+  )
+
+  async function officialSnapshot() {
+    // 解析器每次调用都重读配置；冷却期内它返回 null → 这里不发任何请求（背压）
+    const token = tokenResolver.resolve()
+    if (token === null) return null
+    return officialCached(token)
   }
 
-  // P1：仅允许回环地址访问本接口（余额/用量属于账户隐私）；
-  // DSH 若配置 all-interfaces，同网段也无法读取。
+  // 仅允许回环地址访问（余额/用量属账户隐私）；DSH 若配置 all-interfaces，同网段也读不到。
+  //
+  // 这里**刻意不做限流**：三个路由的请求全部来自本机回环，唯一有效的门就是回环检查本身。
+  // 而所有页面共用一个 60 次/分钟的桶时，批量打开 / 重载 / 会话恢复十几页就会顶破它，
+  // 表现为用量卡片莫名「暂不可用」（开发时反复刷新正是这个模式）。删掉它，突发不再误伤。
   function isLoopback(addr) {
     return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
   }
-  // 简单滑动窗口限流：每 IP 每分钟 60 次（正常客户端每 60s 轮询 1 次）
-  const rateBuckets = new Map()
-  function rateLimited(ip) {
-    const now = Date.now()
-    const hits = (rateBuckets.get(ip) || []).filter((t) => now - t < 60_000)
-    if (hits.length >= 60) return true
-    hits.push(now)
-    rateBuckets.set(ip, hits)
-    return false
+
+  /**
+   * 注册一个只读 GET 路由。
+   *
+   * 三个路由的四道检查完全一样——405 / 回环 / `Cache-Control: no-store` / 异常走 500——
+   * 只有「正常返回什么」不同。抽出来之后每个路由只剩「取数据」那一句（原先三份复制粘贴的
+   * handler 共 120 行）。日志里保留各自的路由名，出错时还认得出是谁。
+   *
+   * @param name - 路由名（日志与 effect 标签用）。
+   * @param path - 精确路径。
+   * @param getBody - 取返回体；抛错即 500（细节留在 Host 日志，不回给浏览器）。
+   */
+  function route(name, path, getBody) {
+    return ctx.effect(() => server.register({
+      kind: 'exact',
+      path,
+      handler: async (req, res) => {
+        const send = (status, body) => {
+          // 余额/用量属隐私数据，禁止浏览器 HTTP 缓存
+          res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          res.end(JSON.stringify(body))
+        }
+        try {
+          if (req.method !== 'GET') {
+            send(405, { ok: false, error: 'method not allowed' })
+            return
+          }
+          if (!isLoopback(req.socket.remoteAddress || '')) {
+            send(403, { ok: false, error: 'forbidden' })
+            return
+          }
+          send(200, await getBody())
+        } catch (err) {
+          // 只回稳定错误码，细节留在 Host 日志
+          ctx.logger.warn(`usage-stats: ${name} route failed: ${String(err)}`)
+          send(500, { ok: false, error: 'internal' })
+        }
+      },
+    }), `usage-stats: ${name} route`)
   }
 
   const server = ctx.get('webServer') ?? ctx.get('httpServer')
   if (server !== undefined && typeof server.register === 'function') {
-    ctx.effect(() => server.register({
-      kind: 'exact',
-      path: QUERY_ROUTE,
-      handler: async (req, res) => {
-        const send = (status, body) => {
-          // P3：余额/用量属隐私数据，禁止浏览器 HTTP 缓存
-          res.writeHead(status, {
-            'Content-Type': 'application/json',
-            'Cache-Control': 'no-store',
-          })
-          res.end(JSON.stringify(body))
-        }
-        try {
-          if (req.method !== 'GET') {
-            send(405, { ok: false, error: 'method not allowed' })
-            return
-          }
-          const remote = req.socket.remoteAddress || ''
-          if (!isLoopback(remote) || rateLimited(remote)) {
-            send(403, { ok: false, error: 'forbidden' })
-            return
-          }
-          const now = Date.now()
-          const payload = {
-            source: 'official',
-            status: 'unavailable',
-            today: null,
-            month: null,
-            currency: null,
-            balance: null,
-            generatedAt: now,
-          }
-          const official = await officialSnapshot()
-          if (official !== null) {
-            // 保留接口原始货币与金额，不做硬编码汇率换算
-            payload.status = 'ready'
-            payload.today = { tokens: official.today.tokens, cost: official.today.cost, calls: official.today.requests }
-            payload.month = { tokens: official.month.tokens, cost: official.month.cost, calls: official.month.requests }
-            payload.currency = official.currency
-            payload.balance = official.balance
-          } else {
-            // 只有"确实没有可用 token"或"平台明确拒绝了这个 token"才让用户去改配置；
-            // 拉取失败（超时/限流/WAF/服务端 5xx）是"暂不可用"，不能谎称 token 没配好。
-            const noToken = tokenState.manual === null && !tokenState.autoScan
-            const rejected = tokenState.manual !== null && tokenState.manualRejectedAt !== null
-            payload.status = (noToken || rejected) ? 'configuration_required' : 'unavailable'
-            payload.officialError = noToken
-              ? '请配置有效的 platformToken 以查看官方用量'
-              : rejected
-                ? 'platformToken 已被平台拒绝（可能已过期），请重新获取后更新配置'
-                : '官方数据暂不可用，请稍后重试'
-            // P2-4：autoScan 开着却拿不到有效 token 时，明确提示（避免默默兜底让人困惑）。
-            // "没问到"（unknown）不能说成"候选无效"——那同样是把请求失败当成结论。
-            if (tokenState.autoScan) {
-              payload.scanHint = tokenState.candidates.length === 0
-                ? 'autoScan 未在浏览器里找到 userToken，请登录 platform.deepseek.com 后重试，或手动配置 platformToken'
-                : tokenState.exhaustedTransient
-                  ? 'autoScan 候选暂未校验成功（官方请求失败），稍后会自动重试'
-                  : 'autoScan 找到的候选均无效（可能含过期/其他网站的 token），建议手动配置 platformToken'
-            }
-          }
-          send(200, payload)
-        } catch (err) {
-          // 只回稳定错误码，细节留在 Host 日志
-          ctx.logger.warn(`usage-stats: query route failed: ${String(err)}`)
-          send(500, { ok: false, error: 'internal' })
-        }
-      },
-    }), 'usage-stats: query route')
+    // 查询路由：官方用量 / 费用 / 余额
+    route('query', QUERY_ROUTE, async () => {
+      const payload = {
+        status: 'unavailable',
+        today: null,
+        month: null,
+        currency: null,
+        balance: null,
+      }
+      const official = await officialSnapshot()
+      if (official !== null) {
+        // 保留接口原始货币与金额，不做硬编码汇率换算
+        payload.status = 'ready'
+        payload.today = { tokens: official.today.tokens, cost: official.today.cost }
+        payload.month = { tokens: official.month.tokens, cost: official.month.cost }
+        payload.currency = official.currency
+        payload.balance = official.balance
+      } else {
+        // 只有"确实没有可用 token"或"平台明确拒绝了这个 token"才让用户去改配置；
+        // 拉取失败（超时/限流/WAF/服务端 5xx）是"暂不可用"，不能谎称 token 没配好。
+        const noToken = !tokenResolver.hasToken()
+        const rejected = tokenResolver.isRejected()
+        payload.status = (noToken || rejected) ? 'configuration_required' : 'unavailable'
+        payload.officialError = noToken
+          ? '请配置有效的 platformToken 以查看官方用量'
+          : rejected
+            ? 'platformToken 已被平台拒绝（可能已过期），请重新获取后更新配置'
+            : '官方数据暂不可用，请稍后重试'
+      }
+      return payload
+    })
 
-    // 版本检测路由：仅供本机页面读取「是否有新版」（非敏感，但同样回环+限流）。
-    ctx.effect(() => server.register({
-      kind: 'exact',
-      path: UPDATE_ROUTE,
-      handler: async (req, res) => {
-        const send = (status, body) => {
-          res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
-          res.end(JSON.stringify(body))
-        }
-        try {
-          if (req.method !== 'GET') {
-            send(405, { ok: false, error: 'method not allowed' })
-            return
-          }
-          const remote = req.socket.remoteAddress || ''
-          if (!isLoopback(remote) || rateLimited(remote)) {
-            send(403, { ok: false, error: 'forbidden' })
-            return
-          }
-          const data = await updateSnapshot()
-          send(200, { ok: true, ...data })
-        } catch (err) {
-          ctx.logger.warn(`usage-stats: update route failed: ${String(err)}`)
-          send(500, { ok: false, error: 'internal' })
-        }
-      },
-    }), 'usage-stats: update route')
+    // 版本检测：仅供本机页面读取「是否有新版」（非敏感）
+    route('update', UPDATE_ROUTE, async () => ({ ok: true, ...(await updateSnapshot()) }))
 
-    // 服务状态路由：同样回环 + 限流。抓取在 Host 做——status.deepseek.com 无 CORS
-    // 头，浏览器端直接 fetch 拿不到；Host 侧结果 5 分钟缓存，客户端 5 分钟轮询。
-    ctx.effect(() => server.register({
-      kind: 'exact',
-      path: STATUS_ROUTE,
-      handler: async (req, res) => {
-        const send = (status, body) => {
-          res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
-          res.end(JSON.stringify(body))
-        }
-        try {
-          if (req.method !== 'GET') {
-            send(405, { ok: false, error: 'method not allowed' })
-            return
-          }
-          const remote = req.socket.remoteAddress || ''
-          if (!isLoopback(remote) || rateLimited(remote)) {
-            send(403, { ok: false, error: 'forbidden' })
-            return
-          }
-          send(200, await statusSnapshot())
-        } catch (err) {
-          ctx.logger.warn(`usage-stats: status route failed: ${String(err)}`)
-          send(500, { ok: false, error: 'internal' })
-        }
-      },
-    }), 'usage-stats: status route')
+    // 服务状态：抓取在 Host 做——status.deepseek.com 无 CORS 头，浏览器端直接 fetch 拿不到；
+    // Host 侧结果有缓存（无告警 5 分钟 / 有告警 30 秒），客户端按同样的节奏轮询。
+    route('status', STATUS_ROUTE, () => statusSnapshot())
   }
 }
 
 // 仅供本地校验解析与缓存策略（判据来自真实 feed 的真实形状）
-export const __test = { parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml, createStatusSnapshot, compareVersions, parseVersion, isAlphaVersion, releaseTagToVersion, highestReleaseVersion, createUpdateSnapshot, fetchLatestDshVersion }
+export const __test = { cached, createTokenResolver, parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml, createStatusSnapshot, compareVersions, parseVersion, isAlphaVersion, createUpdateSnapshot, updateInfo, statusTtlOf, idleStatus, fetchLatestDshVersion }

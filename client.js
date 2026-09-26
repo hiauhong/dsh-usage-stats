@@ -1,4 +1,4 @@
-// P2：Node 环境（无 window / 无模块加载器）导入本文件为空操作，避免 ReferenceError
+// Node 环境（无 window / 无模块加载器）导入本文件为空操作，避免 ReferenceError
 if (typeof window !== 'undefined' && window.__ModuleLoader__) {
   window.__ModuleLoader__.load({
     id: 'dsh-usage-stats',
@@ -61,11 +61,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
       ['2026-09-25', '2026-09-27', '中秋'],
       ['2026-10-01', '2026-10-07', '国庆'],
     ]
-    // 调休上班的周末（通知里「X 月 X 日（周六/周日）上班」那些天）：判定上等同普通周末，
-    // 这里只用来把 tooltip 说清楚 —— 谁要是把补班日当工作日算高峰，就踩到 2026-09-19 公告。
-    const CN_MAKEUP_WEEKENDS = [
-      '2026-01-04', '2026-02-14', '2026-02-28', '2026-05-09', '2026-09-20', '2026-10-10',
-    ]
     const PEAK_HOUR_RANGES = [[9, 12], [14, 18]]
 
     function cnHolidayName(ymd) {
@@ -100,10 +95,9 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         return { label: '空闲', hint: `${holiday}假期全天按空闲时段计费${stale}` }
       }
       if (weekday === 0 || weekday === 6) {
-        const makeup = CN_MAKEUP_WEEKENDS.indexOf(ymd) >= 0
-          ? '；官方明确：调休上班的周末也按空闲时段计费'
-          : ''
-        return { label: '空闲', hint: `周末全天按空闲时段计费${makeup}${stale}` }
+        // 调休上班的周末同样落在这里：官方口径是补班日也按空闲计费（2026-09-19 公告），
+        // 而它们本来就是周末，所以不需要单独一张表 —— 判定上等同普通周末。
+        return { label: '空闲', hint: `周末全天按空闲时段计费${stale}` }
       }
       for (const [from, to] of PEAK_HOUR_RANGES) {
         if (hour >= from && hour < to) {
@@ -148,8 +142,6 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           /* flex: none，别写 100%：这个卡片始终在 column 方向的 .dshus-wrap 里，
              那里的 flex-basis 100% 是**高度**（不是宽度）—— 它会吃掉整个 wrap 高度，
              把上面的告警行挤成 6px（告警自身 overflow:hidden 于是一半字被裁）。
-             实测（2026-09-20，注入告警行后量 DOM）：flex:0 0 100% 时告警行 6px/内容 14px；
-             改 none 后 21.4px，卡片回到自然高度 70.2px，wrap = 三者之和 94.6px。
              宽度不受影响：column 容器里靠 align-items: stretch 撑满。 */
           display: flex; flex-direction: column; gap: 3px; flex: none;
           min-width: 0; padding: 7px var(--dsh-sidebar-inline-padding); box-sizing: border-box;
@@ -235,8 +227,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
 
         // 服务状态：只在「有影响」时出现。拉不到就按「没问题」处理（问不到 ≠ 出问题）。
         // 有告警时改 1 分钟一轮 —— 5 分钟一轮会让「官方已标 resolved」多挂好几分钟
-        //（2026-09-23 实测：15:44 恢复，界面还挂着，刷新才消失）。host 侧也同步收紧到 30s，
-        // 两段加起来恢复最多 ~1 分钟就翻牌；没告警时仍是 5 分钟一轮。
+        // host 侧也同步收紧到 30s，两段加起来恢复最多 ~1 分钟就翻牌；没告警时仍是 5 分钟一轮。
         const [alert, setAlert] = React.useState(null)
         React.useEffect(() => {
           let alive = true
@@ -330,7 +321,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         }
 
         if (data.status !== 'ready') {
-          const message = data.scanHint || data.officialError || '官方数据暂不可用'
+          const message = data.officialError || '官方数据暂不可用'
           if (!wide) return railAlert !== null ? railAlert : React.createElement('div', { className: 'dshus-rail', title: message }, 'Σ —')
           return withHint(React.createElement('div', { className: 'dshus-block' }, head,
             React.createElement('div', { className: 'dshus-loading' }, message)))
@@ -346,13 +337,12 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           React.createElement('span', { className: 'dshus-cost' }, formatMoney(data.month.cost, data.currency)))
 
         if (wide) {
-          return withHint(React.createElement('div', { className: 'dshus-block' }, head, todayLine, monthLine,
-            data.scanHint ? React.createElement('div', { className: 'dshus-loading' }, data.scanHint) : null))
+          return withHint(React.createElement('div', { className: 'dshus-block' }, head, todayLine, monthLine))
         }
         if (railAlert !== null) return railAlert
         return React.createElement('div', {
           className: 'dshus-rail',
-          title: `今日 ${formatCompactTokens(data.today.tokens)} tok · ${formatMoney(data.today.cost, data.currency)}，本月 ${formatCompactTokens(data.month.tokens)} tok${data.scanHint ? `\n${data.scanHint}` : ''}`,
+          title: `今日 ${formatCompactTokens(data.today.tokens)} tok · ${formatMoney(data.today.cost, data.currency)}，本月 ${formatCompactTokens(data.month.tokens)} tok`,
         }, `Σ ${formatCompactTokens(data.today.tokens)}`)
       }
 

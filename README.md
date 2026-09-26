@@ -63,32 +63,9 @@ userToken 获取：打开 platform.deepseek.com → F12 → Application →
 Local Storage → `https://platform.deepseek.com` → 复制 `userToken` 的 value。
 改文件即生效。
 
-不想手动填也可以**自动扫描本机浏览器**（Chrome / Edge / Brave / Arc），显式开启
-（默认关闭）：
-
-```json
-{ "autoScan": true }
-```
-
-### autoScan 工作原理与已知限制
-
-autoScan 会读取各浏览器 profile 的 `Local Storage/leveldb`，启发式提取
-`platform.deepseek.com` 的 `userToken` 候选，再逐个发往 DeepSeek 校验，选有效的那个。
-
-因为 Chrome 的 LevelDB 在压缩（compaction）时可能把一条记录的 **key 和 value 分散到
-不同 SSTable 文件**，且 localStorage 值实际以 `{"value":"...","__version":"0"}` 形式存储，
-纯文本扫描有时抓不到（或抓到**其他网站的旧 token**，校验会返回 40003 无效）。
-
-插件为此做了两处收敛（`scanBrowserTokens`）：
-
-- 优先收集**含 `platform.deepseek.com` origin 文件**里、长度在 `55–85` 的独立 base64
-  运行（按接近 65 排序），能命中有效 token 并天然排除其他网站/旧记录的 token；
-- 再用 `userToken` key / origin / `"value":"` **marker 邻近候选**兜底；
-- 候选上限 `MAX_CANDIDATES`（40），并记住"已穷尽"状态，避免无有效 token 时每次查询
-  重复校验全部候选。
-
-**仍非 100% 可靠**（跨 SSTable 是 Chrome 固有限制）。若 autoScan 显示
-`scanHint`（未找到有效 token），最稳的做法是手动填 `platformToken`。
+> 早期版本支持 `"autoScan": true` 自动扫描本机浏览器（Chrome / Edge / Brave / Arc）取
+> userToken。它靠启发式解析 LevelDB、命中率不稳定，**2026-09-26 已移除**（实际无人使用）——
+> 现在只有 `platformToken` 一种配置方式。
 
 ## 检测新版
 
@@ -96,22 +73,19 @@ autoScan 会读取各浏览器 profile 的 `Local Storage/leveldb`，启发式�
 
 - **判定**：读取运行中 DSH 的版本（与 `dsh --version` 同源，取自其 `package.json`），
   对比**最新可装版本**；比本地新即显示「有新版」，无更新则隐藏。
-- **最新可装版本怎么取**：**GitHub Releases 的发布 tag**（`dsh-v*`）为主，加上 npm 上
-  `@deepseek-ai/dsh` 的 `dist-tags.latest` 与 `dist-tags.next`，三者取最高。rc 版本发布时
-  只推进 Releases 和 npm 的 `next`，`latest` 要等转正才动 —— 只看 `latest` 会让跑 rc 的
+- **最新可装版本怎么取**：npm 上 `@deepseek-ai/dsh` 的 `dist-tags.latest` 与 `dist-tags.next`
+  取较高者。rc 版本发布时只推进 `next`，`latest` 要等转正才动 —— 只看 `latest` 会让跑 rc 的
   用户永远检测不到新版（2026-09-23 就是这个漏报）。支持 `-rc.N` 预发布版本比较
   （正式版 > 同号 rc，`rc.2` > `rc.1`）。
+- **为什么只看 npm**：npm 的版本集合是 GitHub Releases 的**超集**（实测 27 个版本里
+  `0.1.5-rc.3` 只在 npm 上，而排除 alpha 后两边最高版一致），少一个源就少一份限流/抖动的可能。
 - **只看 rc 与正式版，排除 alpha**：alpha 是内部构建，官方下一步往往自己就弃了，不催用户升。
-- **频率**：本地缓存 1 小时、页面低频轮询（版本变更极低频），避免频繁请求 GitHub / npm。
-  单个来源失败不牵连其他来源（GitHub 限流时仍看 npm）。
+  `latest` 与 `next` 两个 tag 都过这道过滤。
+- **频率**：本地缓存 1 小时、页面低频轮询（版本变更极低频）。npm 拿不到时只是不亮徽章，
+  不报错也不缓存失败结果。
 - **点击**：只跳转 [deepseek-harness Releases](https://github.com/deepseek-ai/deepseek-harness/releases)，
   不会误触发品牌行的「新建会话」（已做点击冒泡隔离）。
 - 失败的请求不会被缓存，下次自动重试但不报错。
-
-> 2026-09-23 修过一处漏报：装了 `0.1.7-rc.1` 却一直不亮徽章 —— 判定只看 npm 的
-> `dist-tags.latest`，而它当时停在 `0.1.5-rc.3`（rc 只推进 Releases 与 npm `next`）。
-> 私有开发仓另有回归测试 `Scripts/test-update-check.mjs`：23 项覆盖 tag 解析、alpha 排除、
-> 三源取最高、单源失败、TTL 与失败不缓存。
 
 ## 服务状态提示
 
