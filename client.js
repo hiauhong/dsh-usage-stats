@@ -156,12 +156,17 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           text-decoration: none; color: var(--dsw-alias-label-primary);
           border-radius: 4px; padding: 1px 2px 1px 0; align-self: flex-start;
         }
-        .dshus-head:hover { color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); }
+        /* 悬浮底色用 interactive-bg-hover，别用 bg-layer-*：layer 系列在浅色主题里等于
+           底色（都是 #fff），于是白底叠在 #f9fafb 的侧边栏上既看不见徽章、也看不见悬浮
+           反馈；深色主题下同一个 token 是 #232324、对着 #1b1b1c 有对比，所以只考虑深色
+           时看不出问题。interactive-bg-hover 是「叠在任何底色上都成立的 ink/white 覆盖层」，
+           叠出来浅色 #eceef0（ΔE 4.3）、深色 #2c2c2e（ΔE 8.2），两边都读得出来。 */
+        .dshus-head:hover { color: var(--dsw-alias-brand-primary); background: var(--dsw-alias-interactive-bg-hover); }
         .dshus-title { min-width: 0; font-size: 11px; font-weight: 600; line-height: 1.4; }
         .dshus-link { flex: none; color: inherit; font-size: 12px; line-height: 1; }
         .dshus-badge {
           margin-left: 5px; font-size: 9px; line-height: 1; font-weight: 400;
-          color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-1);
+          color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover);
           border-radius: 3px; padding: 2px 4px; align-self: center;
         }
         .dshus-balance {
@@ -186,7 +191,7 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         .dshus-upd-badge {
           flex: none; align-self: center;
           font-size: 9px; line-height: 1; font-weight: 400;
-          color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-layer-1);
+          color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover);
           border-radius: 3px; padding: 2px 5px;
           white-space: nowrap; text-decoration: none; cursor: pointer;
           position: relative; z-index: 1;
