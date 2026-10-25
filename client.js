@@ -169,6 +169,18 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover);
           border-radius: 3px; padding: 2px 4px; align-self: center;
         }
+        /* 高峰上实心琥珀：有颜色 = 高峰，灰 = 空闲，不用读字就能扫出来。
+           用「实心底 + 深墨字」而不是「淡底 + 琥珀字」：amber-600 压 amber-100 只有
+           2.58:1，9px 小字读不清；这组（amber-500 底 + 静态 amber-900 字）是 7.2:1。
+           字色故意用 static token：alias 的 label 系在两个主题里一黑一白，压不住同一个
+           实心底；static-amber-900 两个主题同值（#27241f），所以深浅下都成立。
+           空闲保持中性灰，不另加绿色：绿色在这个界面里容易被读成「服务健康」，
+           而这是计费时段，不是服务状态。 */
+        .dshus-badge-peak {
+          color: var(--dsw-static-amber-900);
+          background: var(--dsw-alias-state-warn-primary);
+          font-weight: 500;
+        }
         .dshus-balance {
           flex: none; color: var(--dsw-alias-label-secondary);
           font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -313,7 +325,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
             React.createElement('span', { className: 'dshus-title' }, '用量信息'),
             React.createElement('span', { className: 'dshus-link' }, '↗'),
             tier !== null
-              ? React.createElement('span', { className: 'dshus-badge', title: tier.hint }, tier.label)
+              ? React.createElement('span', {
+                  className: `dshus-badge dshus-badge-${tier.label === '高峰' ? 'peak' : 'idle'}`,
+                  title: tier.hint,
+                }, tier.label)
               : null),
           data !== null && data.balance !== null && data.balance !== undefined
             ? React.createElement('span', { className: 'dshus-balance' }, formatBalance(data.balance.amount, data.balance.currency))
