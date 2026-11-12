@@ -30,7 +30,8 @@ const QUERY_ROUTE = '/api/usage-stats/query'
 const UPDATE_ROUTE = '/api/usage-stats/update'
 const STATUS_ROUTE = '/api/usage-stats/status'
 const ALERTS_ROUTE = '/api/usage-stats/alerts'
-// 插件自己的设置（当前只有告警静音的组件），与 TOKEN_FILE 分开存：token 是密钥、用户会手改，
+const DISPLAY_ROUTE = '/api/usage-stats/display'
+// 插件自己的设置（告警静音的组件 + token 单位），与 TOKEN_FILE 分开存：token 是密钥、用户会手改，
 // 而设置由设置页写入 —— 混在一个文件里，写设置时失手就会把 token 抹掉。
 const SETTINGS_FILE = join(homedir(), '.dsh', 'dsh-usage-stats.settings.json')
 const CACHE_TTL_MS = 60000
@@ -663,7 +664,9 @@ function alertsOptions(items) {
 }
 
 // ---------------------------------------------------------------------------
-// 告警设置（~/.dsh/dsh-usage-stats.settings.json）
+// 设置（~/.dsh/dsh-usage-stats.settings.json）
+//   一段 alerts：静音的组件；一段 display：token 单位（中文 万/亿 / 英文 K/M/B）。
+//   两段共用一次「读全 + 原子写全」—— 各写各的会把另一段抹掉。
 // ---------------------------------------------------------------------------
 
 /** 只保留已知组件键（手改出错 / 旧版本遗留的未知值一律丢弃）。 */
@@ -678,35 +681,69 @@ function normalizeMuted(value) {
   return out
 }
 
+const DEFAULT_TOKEN_UNIT = 'en'
+const TOKEN_UNITS = ['en', 'zh']
+
+/** 只认 en / zh，其余（含手改成别的词）回默认英文。 */
+function normalizeTokenUnit(value) {
+  return value === 'zh' ? 'zh' : DEFAULT_TOKEN_UNIT
+}
+
 /**
  * 读设置。三种情形刻意区分：
- *   文件不存在 → 默认值（网页版静音，只提示 API）
- *   文件损坏 / 半写入 → **全都提示**（坏配置不该悄悄吞掉告警 —— 少报故障比多报更坏）
- *   正常 → 文件内容（未知键由 normalizeMuted 丢掉）
+ *   文件不存在 → 默认值（网页版静音、只提示 API；token 单位英文）
+ *   文件损坏 / 半写入 → 告警**全都提示**（坏配置不该悄悄吞掉告警 —— 少报故障比多报更坏）；
+ *     单位回默认英文
+ *   正常 → 已知字段归一化（未知键丢弃）
  */
-function readAlertsSettings(file = SETTINGS_FILE) {
+function readSettings(file = SETTINGS_FILE) {
   let text
   try {
     text = readFileSync(file, 'utf8')
   } catch (err) {
-    return { muted: err && err.code === 'ENOENT' ? [...DEFAULT_MUTED] : [] }
+    const missing = err && err.code === 'ENOENT'
+    return { muted: missing ? [...DEFAULT_MUTED] : [], tokenUnit: DEFAULT_TOKEN_UNIT }
   }
   try {
     const json = JSON.parse(text)
-    return { muted: normalizeMuted(json && json.alerts && json.alerts.muted) }
+    return {
+      muted: normalizeMuted(json && json.alerts && json.alerts.muted),
+      tokenUnit: normalizeTokenUnit(json && json.display && json.display.tokenUnit),
+    }
   } catch {
-    return { muted: [] }
+    return { muted: [], tokenUnit: DEFAULT_TOKEN_UNIT }
   }
 }
 
-/** 原子写设置（同目录临时文件 + rename）：半写入的 JSON 会让下次读回默认值。 */
-function writeAlertsSettings(muted, file = SETTINGS_FILE) {
-  const normalized = normalizeMuted(muted)
+/**
+ * 原子写设置（同目录临时文件 + rename）：半写入的 JSON 会让下次读回默认值。
+ * 只传一段时另一段按**磁盘上的当前值**保留（读不全时按默认值）。
+ */
+function writeSettings(next, file = SETTINGS_FILE) {
+  const current = readSettings(file)
+  const muted = normalizeMuted(next.muted === undefined ? current.muted : next.muted)
+  const tokenUnit = normalizeTokenUnit(next.tokenUnit === undefined ? current.tokenUnit : next.tokenUnit)
   mkdirSync(dirname(file), { recursive: true })
   const tmp = `${file}.${process.pid}.tmp`
-  writeFileSync(tmp, `${JSON.stringify({ alerts: { muted: normalized } }, null, 2)}\n`, { mode: 0o600 })
+  writeFileSync(tmp, `${JSON.stringify({ alerts: { muted }, display: { tokenUnit } }, null, 2)}\n`, { mode: 0o600 })
   renameSync(tmp, file)
-  return { muted: normalized }
+  return { muted, tokenUnit }
+}
+
+function readAlertsSettings(file = SETTINGS_FILE) {
+  return { muted: readSettings(file).muted }
+}
+
+function writeAlertsSettings(muted, file = SETTINGS_FILE) {
+  return { muted: writeSettings({ muted }, file).muted }
+}
+
+function readDisplaySettings(file = SETTINGS_FILE) {
+  return { tokenUnit: readSettings(file).tokenUnit }
+}
+
+function writeDisplaySettings(tokenUnit, file = SETTINGS_FILE) {
+  return { tokenUnit: writeSettings({ tokenUnit }, file).tokenUnit }
 }
 
 /** 缓存分片键：静音的组件不同 = 不同的一份状态快照。 */
@@ -970,6 +1007,17 @@ export async function apply(ctx) {
       const saved = writeAlertsSettings(body.muted ?? [])
       return { ok: true, muted: saved.muted }
     }, { methods: ['GET', 'POST'], json: true })
+
+    // 显示设置：token 单位。和 /alerts 用同一个设置文件、同一套原子写；
+    // GET 回当前值，POST 整份覆盖（幂等，便于以后加字段）。
+    route('display', DISPLAY_ROUTE, async ({ method, body }) => {
+      if (method === 'GET') return { ok: true, ...readDisplaySettings() }
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new BadRequest('body must be an object')
+      if (body.tokenUnit !== undefined && !TOKEN_UNITS.includes(body.tokenUnit)) {
+        throw new BadRequest("tokenUnit must be 'en' or 'zh'")
+      }
+      return { ok: true, ...writeDisplaySettings(body.tokenUnit ?? DEFAULT_TOKEN_UNIT) }
+    }, { methods: ['GET', 'POST'], json: true })
   }
 }
 
@@ -991,6 +1039,12 @@ export const __test = {
   normalizeMuted,
   readAlertsSettings,
   writeAlertsSettings,
+  readSettings,
+  writeSettings,
+  readDisplaySettings,
+  writeDisplaySettings,
+  normalizeTokenUnit,
+  DEFAULT_TOKEN_UNIT,
   mutedKeyOf,
   shortStatusLabel,
   statusSeverity,

@@ -17,6 +17,14 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
     const UPDATE_BADGE_TEXT = '有新版'
     const UPDATE_BADGE_CLASS = 'dshus-upd-badge'
     const ALERTS_ROUTE = '/api/usage-stats/alerts'
+    const DISPLAY_ROUTE = '/api/usage-stats/display'
+    // 设置页把单位改了 → 侧边栏立刻换，不等下一轮 60s 刷新
+    const DISPLAY_CHANGED_EVENT = 'dshus:display-changed'
+    // 两个单位各自的写法（hint 里用同一个数举例：2640万 = 26.4M）
+    const TOKEN_UNIT_OPTIONS = [
+      { key: 'zh', label: '中文（万 / 亿）', sample: '2640万 tok' },
+      { key: 'en', label: '英文（K / M / B）', sample: '26.4M tok' },
+    ]
     // host 侧还没重启（客户端热更新先到）时 /alerts 会 404 —— 这时列出官方组件但禁用，
     // 让用户看到「重启 dsh web 后生效」，而不是一句莫名的「读取失败」。
     // 顺序与官方「订阅特定组件」一致（api 组在前，网页版在后）。
@@ -32,12 +40,25 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
     // 设置页存完档发这个事件：侧边栏立刻重拉一次状态，不用等下一轮 5 分钟轮询
     const ALERTS_CHANGED_EVENT = 'dshus:alerts-changed'
 
-    function formatCompactTokens(value) {
+    // --- token 数量格式化（回归测试按这两个标记切片，别删这两行注释）------------
+    const DEFAULT_TOKEN_UNIT = 'en' // 老行为：K / M / B
+    // 单位跟设置走（设置 → 用量统计 → Token 单位）：
+    //   英文：1.2K / 26.4M / 1.23B（默认，老行为）
+    //   中文：1.2万 / 2640万 / 1.23亿
+    // 缩写的档位与小数位两边对齐：万以下不缩写；1 万–10 万留 1 位小数，再往上不留
+    // （26.4M = 2640万，四个字读完；英文的 M 段同样只到十位数才留 2 位）。
+    function formatCompactTokens(value, unit = DEFAULT_TOKEN_UNIT) {
+      if (unit === 'zh') {
+        if (value < 10_000) return String(Math.round(value))
+        if (value < 100_000_000) return `${(value / 10_000).toFixed(value < 100_000 ? 1 : 0)}万`
+        return `${(value / 100_000_000).toFixed(2)}亿`
+      }
       if (value < 1_000) return String(Math.round(value))
       if (value < 1_000_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}K`
       if (value < 1_000_000_000) return `${(value / 1_000_000).toFixed(value < 10_000_000 ? 2 : 1)}M`
       return `${(value / 1_000_000_000).toFixed(2)}B`
     }
+    // --- token 数量格式化结束 ---------------------------------------------------
 
     // 与平台页一致：金额去尾（截断）到 2 位小数，而非四舍五入——避免"多 0.01"
     function truncate2(value) {
@@ -211,6 +232,10 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           display: flex; align-items: center; justify-content: center; padding: 6px 0;
           font-size: 10px; font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary);
           text-decoration: none;
+          /* 收起态只有 35px 宽：中文「4675万」不能在数字和「万」之间断开，否则
+             「Σ / 4675 / 万」竖成三行；keep-all 只禁止这种 CJK 断行，Σ 后的空格仍可断，
+             于是稳定成两行（和英文「Σ / 46.8M」一致）。 */
+          word-break: keep-all;
         }
         /* 收起态有故障：整项从 Σ 摘要换成图标（tooltip 带完整文案） */
         .dshus-rail-alert { border-radius: 4px; padding: 4px 0; font-size: 12px; }
@@ -239,7 +264,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         .dshus-set-carddesc { color: var(--dsw-alias-label-secondary); font-size: 12px; font-weight: 400; }
         .dshus-set-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; cursor: pointer; }
         .dshus-set-row + .dshus-set-row { border-top: 1px solid var(--dsw-alias-border-l1); }
-        .dshus-set-row input[type="checkbox"] { flex: none; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--dsw-alias-state-business-primary); cursor: pointer; }
+        .dshus-set-row input[type="checkbox"],
+        .dshus-set-row input[type="radio"] { flex: none; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--dsw-alias-state-business-primary); cursor: pointer; }
         .dshus-set-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
         .dshus-set-label { font-size: 13px; }
         .dshus-set-hint { color: var(--dsw-alias-label-tertiary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -324,6 +350,25 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           }
         }, [])
 
+        // token 单位：设置页写 host（~/.dsh/dsh-usage-stats.settings.json 的 display.tokenUnit），
+        // 这里读一次、跟着 DISPLAY_CHANGED_EVENT 换。读不到就按默认英文——与老版本显示一致。
+        const [tokenUnit, setTokenUnit] = React.useState(DEFAULT_TOKEN_UNIT)
+        React.useEffect(() => {
+          let alive = true
+          const load = () => {
+            fetch(DISPLAY_ROUTE, { headers: { Accept: 'application/json' } })
+              .then((response) => (response.ok ? response.json() : null))
+              .then((payload) => {
+                if (!alive || payload === null || typeof payload !== 'object') return
+                setTokenUnit(payload.tokenUnit === 'zh' ? 'zh' : DEFAULT_TOKEN_UNIT)
+              })
+              .catch(() => { /* 读不到就保持默认，不打扰 */ })
+          }
+          load()
+          window.addEventListener(DISPLAY_CHANGED_EVENT, load)
+          return () => { alive = false; window.removeEventListener(DISPLAY_CHANGED_EVENT, load) }
+        }, [])
+
         // severity 只认 error，其余（含字段缺失）一律按 warn 渲染，避免出现没样式的条
         const alertSeverity = alert === null ? null : (alert.severity === 'error' ? 'error' : 'warn')
         const alertIcon = alert === null ? '' : (alertSeverity === 'error' ? '⛔' : '⚠')
@@ -391,11 +436,11 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
 
         const todayLine = React.createElement('div', { className: 'dshus-row' },
           React.createElement('span', { className: 'dshus-label' }, '今日'),
-          React.createElement('span', { className: 'dshus-tok' }, `${formatCompactTokens(data.today.tokens)} tok`),
+          React.createElement('span', { className: 'dshus-tok' }, `${formatCompactTokens(data.today.tokens, tokenUnit)} tok`),
           React.createElement('span', { className: 'dshus-cost' }, formatMoney(data.today.cost, data.currency)))
         const monthLine = React.createElement('div', { className: 'dshus-row' },
           React.createElement('span', { className: 'dshus-label' }, '本月'),
-          React.createElement('span', { className: 'dshus-tok' }, `${formatCompactTokens(data.month.tokens)} tok`),
+          React.createElement('span', { className: 'dshus-tok' }, `${formatCompactTokens(data.month.tokens, tokenUnit)} tok`),
           React.createElement('span', { className: 'dshus-cost' }, formatMoney(data.month.cost, data.currency)))
 
         if (wide) {
@@ -404,8 +449,8 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         if (railAlert !== null) return railAlert
         return React.createElement('div', {
           className: 'dshus-rail',
-          title: `今日 ${formatCompactTokens(data.today.tokens)} tok · ${formatMoney(data.today.cost, data.currency)}，本月 ${formatCompactTokens(data.month.tokens)} tok`,
-        }, `Σ ${formatCompactTokens(data.today.tokens)}`)
+          title: `今日 ${formatCompactTokens(data.today.tokens, tokenUnit)} tok · ${formatMoney(data.today.cost, data.currency)}，本月 ${formatCompactTokens(data.month.tokens, tokenUnit)} tok`,
+        }, `Σ ${formatCompactTokens(data.today.tokens, tokenUnit)}`)
       }
 
       // ---- 设置页：API 告警组件 ----
@@ -445,6 +490,48 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           return () => { alive = false }
         }, [])
 
+        // Token 单位：单独一条 /display 路由。host 还是旧进程时它会 404 ——
+        // 与 /alerts 的降级互不牵连（告警设置照常能改），这一项先禁用并说明。
+        const [unit, setUnit] = React.useState({ phase: 'loading', value: DEFAULT_TOKEN_UNIT, error: null })
+        React.useEffect(() => {
+          let alive = true
+          fetch(DISPLAY_ROUTE, { headers: { Accept: 'application/json' } })
+            .then((response) => {
+              if (response.status === 404) return { ok: 'restart-required' }
+              return response.ok ? response.json() : Promise.reject(new Error(String(response.status)))
+            })
+            .then((payload) => {
+              if (!alive) return
+              if (payload && payload.ok === 'restart-required') {
+                setUnit({ phase: 'skew', value: DEFAULT_TOKEN_UNIT, error: null })
+                return
+              }
+              if (!payload || payload.ok !== true) throw new Error('invalid display response')
+              setUnit({ phase: 'ready', value: payload.tokenUnit === 'zh' ? 'zh' : DEFAULT_TOKEN_UNIT, error: null })
+            })
+            .catch(() => { if (alive) setUnit({ phase: 'error', value: DEFAULT_TOKEN_UNIT, error: '读取 Token 单位失败，请稍后重试' }) })
+          return () => { alive = false }
+        }, [])
+
+        const saveUnit = (next) => {
+          // 先本地翻牌（单选框立刻响应），失败再回滚
+          const previous = unit.value
+          setUnit({ phase: 'ready', value: next, error: null })
+          fetch(DISPLAY_ROUTE, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ tokenUnit: next }),
+          })
+            .then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+            .then((payload) => {
+              if (!payload || payload.ok !== true) throw new Error('invalid display response')
+              setUnit({ phase: 'ready', value: payload.tokenUnit === 'zh' ? 'zh' : DEFAULT_TOKEN_UNIT, error: null })
+              // 侧边栏立刻换单位，不等下一轮刷新
+              window.dispatchEvent(new CustomEvent(DISPLAY_CHANGED_EVENT))
+            })
+            .catch(() => setUnit({ phase: 'ready', value: previous, error: '保存失败（设置未生效），请稍后重试' }))
+        }
+
         const save = (nextMuted) => {
           // 先本地翻牌（勾选框立刻响应），失败再回滚提示
           setState((prev) => ({ ...prev, muted: nextMuted, error: null }))
@@ -473,6 +560,30 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         const children = [React.createElement('h2', { className: 'dshus-set-title', key: 'title' }, '用量统计')]
         children.push(React.createElement('p', { className: 'dshus-set-intro', key: 'intro' },
           '侧边栏「用量信息」卡片与官方服务故障提示的偏好设置。'))
+
+        // 「Token 单位」放最上面：它是这一页里最先要用到、也最常改的一项。
+        const unitRows = TOKEN_UNIT_OPTIONS.map((option) => React.createElement('label', { className: 'dshus-set-row', key: option.key },
+          React.createElement('input', {
+            type: 'radio',
+            name: 'dshus-token-unit',
+            checked: unit.value === option.key,
+            disabled: unit.phase !== 'ready',
+            onChange: unit.phase === 'ready' ? () => saveUnit(option.key) : undefined,
+          }),
+          React.createElement('span', { className: 'dshus-set-body' },
+            React.createElement('span', { className: 'dshus-set-label' }, option.label),
+            React.createElement('span', { className: 'dshus-set-hint' }, option.sample))))
+        children.push(React.createElement('div', { className: 'dshus-set-card', key: 'unit' },
+          React.createElement('div', { className: 'dshus-set-cardhead' },
+            React.createElement('span', null, 'Token 单位'),
+            React.createElement('span', { className: 'dshus-set-carddesc' }, '侧边栏里的 token 数量怎么读')),
+          unitRows,
+          React.createElement('p', { className: 'dshus-set-note' },
+            unit.phase === 'skew'
+              ? '插件已更新，但 Host 还是旧进程（没有 /api/usage-stats/display 路由）：重启 dsh web 后可选。'
+              : unit.error !== null
+                ? unit.error
+                : '只影响显示，不改任何数值。中文按万 / 亿，英文按 K / M / B。')))
 
         const optionRows = (options, disabled) => options.map((option) => {
           const key = String(option.key)

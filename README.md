@@ -50,9 +50,11 @@ dsh plugin --profile web add ./dsh-usage-stats   # 也可以从 GitHub 装：git
 
 **3. 看数据**：侧边栏左下角（设置按钮上方）就是卡片。点标题「用量信息↗」可跳官方用量页看明细。
 
-**4. 选告警组件**（可选）：设置 → 最下面的「用量统计」→ 勾选你关心的组件。
+**4. 设置**（可选）：设置 → 最下面的「用量统计」。最上面是 **Token 单位**，下面按官方组件选告警。
 
-这一页对应官方状态页的「订阅更新 → 订阅特定组件」：
+- **Token 单位**：中文按万 / 亿（`2640万 tok`），英文按 K / M / B（`26.4M tok`）。只影响显示，
+  不改任何数值；默认英文（和老版本一致）。
+- **告警组件**：对应官方状态页的「订阅更新 → 订阅特定组件」：
 
 | 分组 | 组件 |
 |---|---|
@@ -62,16 +64,16 @@ dsh plugin --profile web add ./dsh-usage-stats   # 也可以从 GitHub 装：git
 网页版默认关闭，因为 DSH 走的是 API —— 但想收也可以勾上。取消勾选 = 静音：该组件再出故障时侧边栏
 不提示，别的组件照常提示。
 
-![设置 → 用量统计：按官方组件静音告警](example-settings.png)
+![设置 → 用量统计：Token 单位在最上面，下面按官方组件静音告警](example-settings.png)
 
 选择存在 `~/.dsh/dsh-usage-stats.settings.json`（与 token 文件分开，互不影响）：
 
 ```json
-{ "alerts": { "muted": ["chat", "upload", "pro"] } }
+{ "alerts": { "muted": ["chat", "upload", "pro"] }, "display": { "tokenUnit": "zh" } }
 ```
 
-手改这个文件同样生效（改完刷新页面即可）。没有这个文件时默认静音网页版（`chat` / `upload`）；
-文件坏了会回到「全都提示」，不会把告警静默掉。
+手改这个文件同样生效（改完刷新页面即可）。没有这个文件时默认静音网页版（`chat` / `upload`）、
+单位用英文；文件坏了会回到「全都提示」，不会把告警静默掉。
 
 ## 已知限制 / 注意
 
@@ -99,12 +101,14 @@ dsh plugin --profile web add ./dsh-usage-stats   # 也可以从 GitHub 装：git
 
 技术细节收在这一节：
 
-- 形态：Host 侧注册 `/api/usage-stats/{query,update,status,alerts}` 四个同源路由，客户端只用 React
+- 形态：Host 侧注册 `/api/usage-stats/{query,update,status,alerts,display}` 五个同源路由，客户端只用 React
   渲染侧边栏插槽与设置页插槽，不直连官方接口（status.deepseek.com 没有 CORS 头，RSS 是唯一的机器接口）。
 - 告警组件：官方可订阅组件（`COMPONENT_RULES`）映射到稳定键（`pro`/`flash`/`search`/`fetch`/`chat`/`upload`
   + 兜底 `other`），键不含版本号。`status` 路由按 `alerts` 设置过滤，静音项进缓存键（改设置 = 换一份快照）；
   `alerts` 路由 `GET` 给组件清单（标签取自官方组件名，省掉第二次抓 feed）、`POST` 整份覆盖静音项
-  （原子写、未知键丢弃、坏文件回「全都提示」）。
+  （原子写、未知键丢弃、坏文件回「全都提示」）。`display` 路由管 token 单位（`en` / `zh`），
+  与 `alerts` 共用同一个设置文件：一次读全、原子写全，写一段不会抹掉另一段；单位只影响客户端显示，
+  不进任何缓存键。
 - 失败纪律：拿不到数据就闭嘴 —— 用量拉不到显示「暂不可用」而不是 0（瞬时失败 ≠ token 无效）；
   状态问不到 ≠ 出问题；npm 请求失败不缓存、下次重试但不报错。
 - 外观：颜色一律取主题 token，跟随 DSH 的深色 / 浅色设置，切换即时生效；设置页与官方设置页同宽（720px）。
@@ -116,8 +120,8 @@ dsh plugin --profile web add ./dsh-usage-stats   # 也可以从 GitHub 装：git
   设置触发行，插件没有可注册的 slot，所以按行注入节点（`[class*="triggerRow"]`），并用
   MutationObserver 处理行晚渲染 / React 重建。收起成图标栏时那一行只有 36px（< 120px 判据），
   徽章先撤掉，展开后补回来。
-- 测试：`Scripts/` 下有 DOM 各状态回归、峰谷 29 例、状态恢复滞后 10 例、告警组件与设置 34 例、路由集成 20 例，
-  以及主题对比度与告警布局的真机校验脚本（跑法见脚本头部注释）。
+- 测试：`Scripts/` 下有 DOM 各状态回归 20 例、token 单位格式化 19 例、峰谷 29 例、状态恢复滞后、
+  告警组件与设置读写、路由集成 24 例，以及主题对比度与告警布局的真机校验脚本（跑法见脚本头部注释）。
 
 ## 卸载
 
