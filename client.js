@@ -16,6 +16,21 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
     const STATUS_POLL_ALERT_MS = 60 * 1000 // 有告警：1 分钟一轮盯恢复，别让已解决的告警多挂几分钟
     const UPDATE_BADGE_TEXT = '有新版'
     const UPDATE_BADGE_CLASS = 'dshus-upd-badge'
+    const ALERTS_ROUTE = '/api/usage-stats/alerts'
+    // host 侧还没重启（客户端热更新先到）时 /alerts 会 404 —— 这时列出官方组件但禁用，
+    // 让用户看到「重启 dsh web 后生效」，而不是一句莫名的「读取失败」。
+    // 顺序与官方「订阅特定组件」一致（api 组在前，网页版在后）。
+    const FALLBACK_COMPONENT_OPTIONS = [
+      { key: 'pro', group: 'api', label: 'Pro', component: null },
+      { key: 'flash', group: 'api', label: 'Flash', component: null },
+      { key: 'search', group: 'api', label: '搜索 API', component: null },
+      { key: 'fetch', group: 'api', label: '抓取 API', component: null },
+      { key: 'other', group: 'api', label: '其它 API', component: null },
+      { key: 'chat', group: 'web', label: '对话服务', component: null },
+      { key: 'upload', group: 'web', label: '上传文件服务', component: null },
+    ]
+    // 设置页存完档发这个事件：侧边栏立刻重拉一次状态，不用等下一轮 5 分钟轮询
+    const ALERTS_CHANGED_EVENT = 'dshus:alerts-changed'
 
     function formatCompactTokens(value) {
       if (value < 1_000) return String(Math.round(value))
@@ -200,15 +215,38 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         /* 收起态有故障：整项从 Σ 摘要换成图标（tooltip 带完整文案） */
         .dshus-rail-alert { border-radius: 4px; padding: 4px 0; font-size: 12px; }
         .dshus-loading { color: var(--dsw-alias-label-tertiary); font-size: 10px; }
+        /* 沿用原来「有新版」小徽章的样式，只挪位置 + 字号提到 11px（与用量卡正文同号）；
+           右边缘跟上面的用量卡对齐：卡片内容内缩一个 --dsh-sidebar-inline-padding，
+           这里补同样的右边距，别比「余额」那一列多探出去 8px。 */
         .dshus-upd-badge {
-          flex: none; align-self: center;
-          font-size: 9px; line-height: 1; font-weight: 400;
+          flex: none; margin-inline-start: auto;
+          margin-inline-end: var(--dsh-sidebar-inline-padding, 8px);
+          align-self: center;
+          font-size: 11px; line-height: 1; font-weight: 400;
           color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-interactive-bg-hover);
-          border-radius: 3px; padding: 2px 5px;
+          border-radius: 3px; padding: 3px 6px;
           white-space: nowrap; text-decoration: none; cursor: pointer;
-          position: relative; z-index: 1;
         }
         .dshus-upd-badge:hover { color: var(--dsw-alias-brand-primary); }
+
+        /* ---- 设置页：API 告警组件 ---- */
+        /* 与官方设置页同宽（720px）+ 语义 token，浅色/深色跟着主题走 */
+        .dshus-set { display: flex; flex-direction: column; gap: 12px; max-width: 720px; font-size: 13px; line-height: 20px; color: var(--dsw-alias-label-primary); }
+        .dshus-set-title { margin: 0; font-size: 16px; font-weight: 500; line-height: 24px; }
+        .dshus-set-intro { margin: 0; color: var(--dsw-alias-label-secondary); }
+        .dshus-set-card { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 12px; }
+        .dshus-set-cardhead { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-weight: 500; }
+        .dshus-set-carddesc { color: var(--dsw-alias-label-secondary); font-size: 12px; font-weight: 400; }
+        .dshus-set-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; cursor: pointer; }
+        .dshus-set-row + .dshus-set-row { border-top: 1px solid var(--dsw-alias-border-l1); }
+        .dshus-set-row input[type="checkbox"] { flex: none; width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--dsw-alias-state-business-primary); cursor: pointer; }
+        .dshus-set-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+        .dshus-set-label { font-size: 13px; }
+        .dshus-set-hint { color: var(--dsw-alias-label-tertiary); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .dshus-set-note { margin: 2px 0 0; color: var(--dsw-alias-label-tertiary); font-size: 12px; }
+        .dshus-set-msg { font-size: 12px; }
+        .dshus-set-msg-error { color: var(--dsw-alias-state-error-primary); }
+        .dshus-set-msg-ok { color: var(--dsw-alias-label-tertiary); }
       `
       document.head.appendChild(style)
       ctx.on('dispose', () => { style.remove() })
@@ -274,11 +312,15 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
           // 标签页在后台会被节流/冻结，定时器停摆；回到前台补拉一次（「刷新才消失」的另一半原因）
           const onVisible = () => { if (document.visibilityState === 'visible') load() }
           document.addEventListener('visibilitychange', onVisible)
+          // 设置页改了静音的组件：立刻重拉，别等下一轮轮询（5 分钟太久，用户会以为没生效）
+          const onAlertsChanged = () => { load() }
+          window.addEventListener(ALERTS_CHANGED_EVENT, onAlertsChanged)
           load()
           return () => {
             alive = false
             if (timer !== null) clearTimeout(timer)
             document.removeEventListener('visibilitychange', onVisible)
+            window.removeEventListener(ALERTS_CHANGED_EVENT, onAlertsChanged)
           }
         }, [])
 
@@ -366,49 +408,204 @@ if (typeof window !== 'undefined' && window.__ModuleLoader__) {
         }, `Σ ${formatCompactTokens(data.today.tokens)}`)
       }
 
+      // ---- 设置页：API 告警组件 ----
+      // 官方状态页的「订阅更新 → 订阅特定组件」就是这页的对应物：按官方组件（V4 Pro / V4.1 Flash /
+      // 搜索 API / 抓取 API / 对话服务 / 上传文件服务）逐项勾选。用户通常只关心自己在用的那几项：
+      // pro 有告警而自己跑 flash 时不该被打扰。关掉的项写进 host 侧设置
+      // （~/.dsh/dsh-usage-stats.settings.json），状态路由据此过滤。
+      function UsageStatsSettings() {
+        const [state, setState] = React.useState({ phase: 'loading', options: [], muted: [], error: null })
+        const [saved, setSaved] = React.useState(false)
+
+        React.useEffect(() => {
+          let alive = true
+          fetch(ALERTS_ROUTE, { headers: { Accept: 'application/json' } })
+            .then((response) => {
+              // 404 = 客户端已更新、host 还是旧进程（插件升级后的常态）：照实说，别当故障
+              if (response.status === 404) return { ok: 'restart-required' }
+              return response.ok ? response.json() : Promise.reject(new Error(String(response.status)))
+            })
+            .then((payload) => {
+              if (payload && payload.ok === 'restart-required') {
+                if (alive) setState({ phase: 'skew', options: FALLBACK_COMPONENT_OPTIONS, muted: [], error: null })
+                return
+              }
+              if (!alive) return
+              if (!payload || payload.ok !== true) throw new Error('invalid alerts response')
+              setState({
+                phase: 'ready',
+                options: Array.isArray(payload.options) ? payload.options : [],
+                muted: Array.isArray(payload.muted) ? payload.muted : [],
+                error: null,
+              })
+            })
+            .catch(() => {
+              if (alive) setState({ phase: 'error', options: [], muted: [], error: '读取设置失败，请稍后重试；刚更新过插件的话，重启 dsh web 后生效' })
+            })
+          return () => { alive = false }
+        }, [])
+
+        const save = (nextMuted) => {
+          // 先本地翻牌（勾选框立刻响应），失败再回滚提示
+          setState((prev) => ({ ...prev, muted: nextMuted, error: null }))
+          setSaved(false)
+          fetch(ALERTS_ROUTE, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ muted: nextMuted }),
+          })
+            .then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+            .then((payload) => {
+              if (!payload || payload.ok !== true) throw new Error('invalid alerts response')
+              setState((prev) => ({ ...prev, muted: Array.isArray(payload.muted) ? payload.muted : prev.muted }))
+              setSaved(true)
+              // 让侧边栏立刻按新设置重拉一次状态，否则最长要等下一轮 5 分钟轮询
+              window.dispatchEvent(new CustomEvent(ALERTS_CHANGED_EVENT))
+            })
+            .catch(() => setState((prev) => ({ ...prev, error: '保存失败（设置未生效），请稍后重试' })))
+        }
+
+        const toggle = (key) => {
+          const muted = state.muted.includes(key) ? state.muted.filter((item) => item !== key) : [...state.muted, key]
+          save(muted)
+        }
+
+        const children = [React.createElement('h2', { className: 'dshus-set-title', key: 'title' }, '用量统计')]
+        children.push(React.createElement('p', { className: 'dshus-set-intro', key: 'intro' },
+          '侧边栏「用量信息」卡片与官方服务故障提示的偏好设置。'))
+
+        const optionRows = (options, disabled) => options.map((option) => {
+          const key = String(option.key)
+          const on = disabled ? true : !state.muted.includes(key)
+          return React.createElement('label', { className: 'dshus-set-row', key },
+            React.createElement('input', {
+              type: 'checkbox',
+              checked: on,
+              disabled,
+              onChange: disabled ? undefined : () => toggle(key),
+            }),
+            React.createElement('span', { className: 'dshus-set-body' },
+              React.createElement('span', { className: 'dshus-set-label' }, String(option.label || key)),
+              option.component
+                ? React.createElement('span', { className: 'dshus-set-hint', title: String(option.component) }, String(option.component))
+                : null))
+        })
+
+        const card = (key, title, desc, options, note, disabled) => React.createElement('div', { className: 'dshus-set-card', key },
+          React.createElement('div', { className: 'dshus-set-cardhead' },
+            React.createElement('span', null, title),
+            React.createElement('span', { className: 'dshus-set-carddesc' }, desc)),
+          optionRows(options, disabled),
+          note === null ? null : React.createElement('p', { className: 'dshus-set-note' }, note))
+
+        if (state.phase === 'loading') {
+          children.push(React.createElement('p', { className: 'dshus-set-note', key: 'loading' }, '读取中…'))
+        } else if (state.phase === 'skew') {
+          children.push(card('skew-api', 'API 服务', '重启 dsh web 后可以在这里勾选',
+            state.options.filter((option) => option.group !== 'web'), null, true))
+          children.push(card('skew-web', '网页版服务', '重启 dsh web 后可以在这里勾选',
+            state.options.filter((option) => option.group === 'web'), null, true))
+          children.push(React.createElement('p', { className: 'dshus-set-note', key: 'skew-note' },
+            '插件已更新，但 Host 还是旧进程（没有 /api/usage-stats/alerts 路由）：重启 dsh web 后本页生效。'))
+        } else if (state.phase === 'error') {
+          children.push(React.createElement('p', { className: 'dshus-set-msg dshus-set-msg-error', key: 'error' }, state.error))
+        } else {
+          const api = state.options.filter((option) => option.group !== 'web')
+          const web = state.options.filter((option) => option.group === 'web')
+          children.push(card('api', 'API 服务', '只提示勾选组件的官方故障', api,
+            '与官方状态页「订阅更新 → 订阅特定组件」一一对应；「其它 API」是官方以后新增组件的兜底。'
+            + '取消勾选即静音，全部取消就不再提示任何 API 故障。', false))
+          children.push(card('web', '网页版服务', '默认关闭：DSH 走 API，与网页版无关', web,
+            '对话服务、上传文件服务属于网页版（deepseek.com）。勾选后网页版故障也会进侧边栏。', false))
+          if (state.error) children.push(React.createElement('p', { className: 'dshus-set-msg dshus-set-msg-error', key: 'save-error' }, state.error))
+          if (saved && !state.error) children.push(React.createElement('p', { className: 'dshus-set-msg dshus-set-msg-ok', key: 'saved' }, '已保存'))
+        }
+
+        return React.createElement('div', { className: 'dshus-set' }, children)
+      }
+
       ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
         { name: 'sidebar.footer.action', id: 'usage-stats' },
         (props) => React.createElement(UsageStats, props),
       ))
 
-      // ---- 检测新版：品牌行「有新版」徽章 ----
-      // 只有服务端报告 hasUpdate 才注入。品牌行外层是 <button onClick=startSession>，
-      // 锚点点击必须 stopPropagation（不 preventDefault），否则会触发新建会话。
+      // 设置页挂在 DSH 设置的最后（内置序：账号 -10 / 通用 0 / 模型 10 / 插件 15 / Agent 预设 20；桌宠 30）
+      ctx.slots.inject('settings.section', () => ctx.slots.register({
+        name: 'settings.section',
+        id: 'usage-stats',
+        order: 40,
+        label: () => '用量统计',
+      }, (props) => React.createElement(UsageStatsSettings, props)))
+
+      // ---- 检测新版：账号行右侧的「有新版」徽章 ----
+      // 只有服务端报告 hasUpdate 才注入。位置对齐桌面版自己的更新提示：桌面把
+      // DesktopUpdateIndicator 放在设置行（`sidebar.settings` 的 triggerRow）里，紧挨账号按钮；
+      // 这个插件把徽章放进同一行、靠右，两种版本一眼看到的地方是同一个。
+      //
+      // 桌面版整段不启动：DSH 桌面应用自己带「检查更新」菜单与更新弹窗，再亮一个「有新版」
+      // 是重复打扰，所以桌面版不轮询 /update、也不注入徽章；web 版（浏览器打开）照旧。
+      // 判据与 DSH 前端同源：桌面壳会在页面注入 dshDesktopBoot（见 dsh-web-frontend 的
+      // src/main.ts，它拿这个全局判断要不要走桌面 boot），浏览器里的 web 页面没有它。
+      const isDesktopApp = typeof window !== 'undefined' && window.dshDesktopBoot !== undefined
       const updateState = { hasUpdate: false, url: USAGE_URL }
       let badgeAnchor = null
       let updateTimer = null
       let badgeObserver = null
+      let badgeRow = null
 
-      function clearBadge() {
-        if (badgeObserver !== null) { badgeObserver.disconnect(); badgeObserver = null }
+      // 账号行是 DSH 的设置触发行（slot 名是公开契约，比哈希类名稳）。
+      // 收起成图标栏后这一行只有 36px 宽，放不下徽章：先撤掉，观察器留着，展开后补回来。
+      const BADGE_ROW_SELECTOR = '[data-slot="sidebar.settings"] [class*="triggerRow"]'
+      const BADGE_MIN_ROW_WIDTH = 120
+
+      function removeBadgeAnchor() {
         if (badgeAnchor && badgeAnchor.parentNode) badgeAnchor.parentNode.removeChild(badgeAnchor)
         badgeAnchor = null
       }
 
+      function clearBadge() {
+        if (badgeObserver !== null) { badgeObserver.disconnect(); badgeObserver = null }
+        removeBadgeAnchor()
+      }
+
       function ensureBadge() {
         if (!updateState.hasUpdate) { clearBadge(); return }
-        // observer 必须在**找到容器之前**就装上：它的全部用途就是等品牌行出现/被 React
-        // 重建后把徽章补回来。原先只在注入成功后才安装，于是首轮 /update 比品牌行渲染更快时
-        // （host 缓存命中就是这种：1 小时内刷新页面）徽章会被丢掉，且没有任何东西会重试，
-        // 要等下一轮轮询 —— 1 小时。
+        // observer 必须在**找到那一行之前**就装上：它的全部用途就是等账号行出现 / 被 React
+        // 重建 / 侧栏在宽窄两态之间切换后把徽章补回来。原先只在注入成功后才安装，于是首轮
+        // /update 比品牌行渲染更快时（host 缓存命中就是这种：1 小时内刷新页面）徽章会被丢掉，
+        // 且没有任何东西会重试，要等下一轮轮询 —— 1 小时。
+        // 侧栏收起只改行上的 class（宽度跟着变），所以 class 变化也要观察。
+        const row = document.querySelector(BADGE_ROW_SELECTOR)
+        badgeRow = row
         if (badgeObserver === null) {
-          badgeObserver = new MutationObserver(ensureBadge)
-          badgeObserver.observe(document.body, { childList: true, subtree: true })
+          // 只把「节点增删」和「账号行自己的 class 变化」当信号：整页 class 变化（悬停、
+          // 流式输出时的高亮）每秒都有，不加这层过滤等于每来一次就查一遍 DOM。
+          badgeObserver = new MutationObserver((records = []) => {
+            const relevant = records.some((record) => record.type === 'childList'
+              || (badgeRow !== null && (badgeRow === record.target || badgeRow.contains(record.target))))
+            if (relevant) ensureBadge()
+          })
+          badgeObserver.observe(document.body, {
+            childList: true, subtree: true, attributes: true, attributeFilter: ['class'],
+          })
         }
-        if (badgeAnchor && document.body.contains(badgeAnchor)) return
-        const container = document.querySelector('[class*="brandIdentity"]')
-        if (!container || container.querySelector(`.${UPDATE_BADGE_CLASS}`)) return
+        if (row === null || row.getBoundingClientRect().width < BADGE_MIN_ROW_WIDTH) {
+          removeBadgeAnchor()
+          return
+        }
+        if (badgeAnchor !== null && badgeAnchor.parentNode === row) return
+        removeBadgeAnchor()
         badgeAnchor = document.createElement('a')
         badgeAnchor.className = UPDATE_BADGE_CLASS
         badgeAnchor.href = updateState.url
         badgeAnchor.target = '_blank'
         badgeAnchor.rel = 'noopener noreferrer'
         badgeAnchor.textContent = UPDATE_BADGE_TEXT
-        badgeAnchor.addEventListener('click', (event) => { event.stopPropagation() })
-        container.appendChild(badgeAnchor)
+        row.appendChild(badgeAnchor)
       }
 
       function pollUpdate() {
+        if (isDesktopApp) return // 桌面版由应用自己提示更新，这里不查也不画
         fetch(UPDATE_ROUTE, { headers: { Accept: 'application/json' } })
           .then((response) => response.json())
           .then((payload) => {

@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage-stats",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "侧边栏显示今日/本月 token 消耗、费用与余额，并在官方服务故障时提示 DeepSeek 状态（DeepSeek Harness）",
   "type": "module",
   "main": "index.js",
@@ -16,7 +16,8 @@
     "README.md",
     "LICENSE",
     "example-status.png",
-    "example-update.png"
+    "example-update.png",
+    "example-settings.png"
   ],
   "keywords": [
     "deepseek",

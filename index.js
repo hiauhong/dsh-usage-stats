@@ -9,7 +9,7 @@
 
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { readFileSync, statSync, chmodSync, realpathSync } from 'node:fs'
+import { readFileSync, writeFileSync, renameSync, mkdirSync, statSync, chmodSync, realpathSync } from 'node:fs'
 
 export const name = 'usage-stats'
 export const inject = ['webServer']
@@ -29,6 +29,10 @@ const OFFICIAL_HEADERS = {
 const QUERY_ROUTE = '/api/usage-stats/query'
 const UPDATE_ROUTE = '/api/usage-stats/update'
 const STATUS_ROUTE = '/api/usage-stats/status'
+const ALERTS_ROUTE = '/api/usage-stats/alerts'
+// 插件自己的设置（当前只有告警静音的组件），与 TOKEN_FILE 分开存：token 是密钥、用户会手改，
+// 而设置由设置页写入 —— 混在一个文件里，写设置时失手就会把 token 抹掉。
+const SETTINGS_FILE = join(homedir(), '.dsh', 'dsh-usage-stats.settings.json')
 const CACHE_TTL_MS = 60000
 // 服务状态（status.deepseek.com）：官方状态站是 FlashDuty 托管的 JS 页面，HTML 里
 // 只有标题，Statuspage 式 /api/v2/* 返回 404 —— 能用的机器接口只有 RSS。
@@ -520,10 +524,6 @@ function tagText(block, tag) {
   return decodeXml(m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')).trim()
 }
 
-function isApiRelevantComponent(components) {
-  return String(components).split(',').some((part) => /API/i.test(part))
-}
-
 // 「DeepSeek 网页/API 性能下降（DeepSeek Web/API Degraded Performance）」→「API 性能下降」
 // 侧边栏只有 236px，完整官方标题放不下；完整标题进 tooltip。
 function shortStatusLabel(title) {
@@ -546,11 +546,10 @@ function beijingHm(date) {
   return `${String(t.getUTCHours()).padStart(2, '0')}:${String(t.getUTCMinutes()).padStart(2, '0')}`
 }
 
-// feed 按时间倒序，取最新一条。没有可用条目时返回 null（调用方按「问不到」处理）。
-function parseStatusFeed(xml) {
-  const items = [...String(xml).matchAll(/<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi)].map((m) => m[1])
-  if (items.length === 0) return null
-  const block = items[0]
+// 一条 <item> → 结构。description 是转义过的 HTML，里面带
+//   <strong>Status:</strong> resolved|investigating|...
+//   <strong>Affected components:</strong> <组件列表>
+function parseStatusItem(block) {
   const description = tagText(block, 'description')
   const statusMatch = /Status:\s*<\/strong>\s*([^<]*)/i.exec(description) ?? /Status:\s*([^\n<]*)/i.exec(description)
   const componentsMatch = /Affected components:\s*<\/strong>\s*([^<]*)/i.exec(description)
@@ -564,6 +563,157 @@ function parseStatusFeed(xml) {
   }
 }
 
+// feed 按时间倒序。**全部**条目都要留着：只看第一条时，一条更新的非 API 故障
+// （如「搜索服务异常」）会把仍进行中的 API 故障挤出视野，于是该报的不报。
+function parseStatusFeedItems(xml) {
+  return [...String(xml).matchAll(/<item(?:\s[^>]*)?>([\s\S]*?)<\/item>/gi)].map((m) => parseStatusItem(m[1]))
+}
+
+// 最新一条；没有条目时返回 null（调用方按「问不到」处理）。
+function parseStatusFeed(xml) {
+  return parseStatusFeedItems(xml)[0] ?? null
+}
+
+// ---------------------------------------------------------------------------
+// 告警组件（对齐官方「订阅更新 → 订阅特定组件」）
+// ---------------------------------------------------------------------------
+
+// 官方状态页的可订阅组件（2026-10-27 实测）：
+//   DeepSeek V4 Pro API服务 / DeepSeek V4.1 Flash API服务 / 搜索API服务 / 抓取API服务 /
+//   对话服务（展开是 对话服务(Chatservice) + 上传文件服务(File Upload Service)）
+// RSS 里「受影响组件」的写法与状态页略有出入（如「搜索服务(Search Service)」没带 API），
+// 所以按关键词认，不按全名匹配。键**刻意不含版本号**：V4 → V4.1 只是版本变迁，静音不该失效。
+//
+// group 只用于设置页分组：api = 模型/检索接口，web = 网页版（对话、上传文件）。
+// 默认只提示 api 组（见 DEFAULT_MUTED）——DSH 用户走 API，网页版故障与自己无关。
+const COMPONENT_RULES = [
+  { key: 'pro', group: 'api', test: /pro/i, label: 'Pro' },
+  { key: 'flash', group: 'api', test: /flash/i, label: 'Flash' },
+  { key: 'search', group: 'api', test: /search|搜索/i, label: '搜索 API' },
+  { key: 'fetch', group: 'api', test: /fetch|抓取/i, label: '抓取 API' },
+  { key: 'upload', group: 'web', test: /upload|上传/i, label: '上传文件服务' },
+  { key: 'chat', group: 'web', test: /chat|对话/i, label: '对话服务' },
+]
+// `other` = 认不出的组件兜底：官方以后加新组件时不至于漏提示，也还能一键静音
+const OTHER_KEY = 'other'
+const COMPONENT_KEYS = [...COMPONENT_RULES.map((rule) => rule.key), OTHER_KEY]
+// 没配置过时默认静音网页版：DSH 走 API，对话/上传的故障不该打扰
+const DEFAULT_MUTED = ['chat', 'upload']
+
+/** 单个组件串 → 组件键（认不出的归 other）。 */
+function componentKeyOf(part) {
+  const hit = COMPONENT_RULES.find((rule) => rule.test.test(part))
+  return hit === undefined ? OTHER_KEY : hit.key
+}
+
+/** 组件键的分组（设置页分卡片用）。 */
+function componentGroupOf(key) {
+  const hit = COMPONENT_RULES.find((rule) => rule.key === key)
+  return hit === undefined ? 'api' : hit.group
+}
+
+/** 一条告警影响的组件键集合；空数组 = 官方没写受影响组件，按「说不清就不打扰」跳过。 */
+function componentKeys(components) {
+  const keys = new Set()
+  for (const part of String(components).split(',')) {
+    if (part.trim() === '') continue
+    keys.add(componentKeyOf(part))
+  }
+  return [...keys]
+}
+
+/** 组件标签：Pro/Flash 用官方组件名（带版本号，好认），其余用固定中文名。 */
+function componentLabelOf(key, components) {
+  if (key !== 'pro' && key !== 'flash') {
+    const hit = COMPONENT_RULES.find((rule) => rule.key === key)
+    return hit === undefined ? '其它 API' : hit.label
+  }
+  for (const part of String(components || '').split(',')) {
+    if (componentKeyOf(part) !== key) continue
+    const name = part
+      .split('(')[0]
+      .trim()
+      .replace(/^DeepSeek\s*/i, '')
+      .replace(/\s*API服务\s*$|\s*API\s*Service\s*$/i, '')
+      .trim()
+    if (name !== '') return name
+  }
+  return key === 'pro' ? 'Pro' : 'Flash'
+}
+
+/** 设置页的组件清单：官方可订阅组件 + 其它 API，标签优先取 feed 里的真实组件名。 */
+function alertsOptions(items) {
+  const seen = new Map()
+  for (const item of items || []) {
+    for (const part of String(item.components || '').split(',')) {
+      if (part.trim() === '') continue
+      const key = componentKeyOf(part)
+      if (!seen.has(key)) seen.set(key, part)
+    }
+  }
+  // 顺序与官方订阅框一致：模型 → 检索接口 → 兜底 → 网页版
+  const order = ['pro', 'flash', 'search', 'fetch', OTHER_KEY, 'chat', 'upload']
+  return order.map((key) => ({
+    key,
+    group: componentGroupOf(key),
+    label: componentLabelOf(key, seen.get(key)),
+    // 官方组件原文：设置页当副标题，说明这一项具体指什么（没见过就留空）
+    component: seen.get(key) ?? null,
+  }))
+}
+
+// ---------------------------------------------------------------------------
+// 告警设置（~/.dsh/dsh-usage-stats.settings.json）
+// ---------------------------------------------------------------------------
+
+/** 只保留已知组件键（手改出错 / 旧版本遗留的未知值一律丢弃）。 */
+function normalizeMuted(value) {
+  if (!Array.isArray(value)) return []
+  const out = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const key = entry.trim().toLowerCase()
+    if (COMPONENT_KEYS.includes(key) && !out.includes(key)) out.push(key)
+  }
+  return out
+}
+
+/**
+ * 读设置。三种情形刻意区分：
+ *   文件不存在 → 默认值（网页版静音，只提示 API）
+ *   文件损坏 / 半写入 → **全都提示**（坏配置不该悄悄吞掉告警 —— 少报故障比多报更坏）
+ *   正常 → 文件内容（未知键由 normalizeMuted 丢掉）
+ */
+function readAlertsSettings(file = SETTINGS_FILE) {
+  let text
+  try {
+    text = readFileSync(file, 'utf8')
+  } catch (err) {
+    return { muted: err && err.code === 'ENOENT' ? [...DEFAULT_MUTED] : [] }
+  }
+  try {
+    const json = JSON.parse(text)
+    return { muted: normalizeMuted(json && json.alerts && json.alerts.muted) }
+  } catch {
+    return { muted: [] }
+  }
+}
+
+/** 原子写设置（同目录临时文件 + rename）：半写入的 JSON 会让下次读回默认值。 */
+function writeAlertsSettings(muted, file = SETTINGS_FILE) {
+  const normalized = normalizeMuted(muted)
+  mkdirSync(dirname(file), { recursive: true })
+  const tmp = `${file}.${process.pid}.tmp`
+  writeFileSync(tmp, `${JSON.stringify({ alerts: { muted: normalized } }, null, 2)}\n`, { mode: 0o600 })
+  renameSync(tmp, file)
+  return { muted: normalized }
+}
+
+/** 缓存分片键：静音的组件不同 = 不同的一份状态快照。 */
+function mutedKeyOf(muted) {
+  return normalizeMuted(muted).slice().sort().join(',')
+}
+
 // idle 快照：没有影响（或问不到）时的形状。active:false 就是客户端撤掉告警的信号。
 function idleStatus() {
   return {
@@ -572,29 +722,45 @@ function idleStatus() {
     label: null,
     title: null,
     components: null,
+    componentKeys: [],
     since: null,
     url: STATUS_PAGE_URL,
     updatedAt: Date.now(),
   }
 }
 
-// 判定「最新一条 item 算不算对用户有影响」——纯函数，便于对着真实 feed 校验。
-// 三个条件缺一不可：进行中（未 resolved）、够新（防僵尸）、组件与 API 有关。
-function evaluateStatusItem(item, now) {
-  if (item === null) return idleStatus()
-  const ongoing = item.status !== '' && !/^resolved$/i.test(item.status)
-  const fresh = item.at !== null && now - item.at.getTime() < STATUS_MAX_AGE_MS
-  if (!ongoing || !fresh || !isApiRelevantComponent(item.components)) return idleStatus()
-  return {
-    active: true,
-    severity: statusSeverity(item.title),
-    label: shortStatusLabel(item.title),
-    title: item.title,
-    components: item.components,
-    since: item.at === null ? null : beijingHm(item.at),
-    url: item.link === '' ? STATUS_PAGE_URL : item.link,
-    updatedAt: now,
+// 判定「这批条目里有没有一条该打扰用户」——纯函数，便于对着真实 feed 校验。
+// 四个条件缺一不可：进行中（未 resolved）、够新（防僵尸）、有受影响组件、至少一个组件没被静音。
+// 从新到旧找第一条成立的：更新的无关故障不会盖住仍进行中的故障。
+function evaluateStatusItems(items, now, muted = []) {
+  const mutedSet = new Set(normalizeMuted(muted))
+  for (const item of items || []) {
+    if (item === null || item === undefined) continue
+    const ongoing = item.status !== '' && !/^resolved$/i.test(item.status)
+    const fresh = item.at !== null && now - item.at.getTime() < STATUS_MAX_AGE_MS
+    if (!ongoing || !fresh) continue
+    const keys = componentKeys(item.components)
+    if (keys.length === 0) continue
+    // 条目影响的所有组件都被静音才不报；还有一项亮着就报
+    if (keys.every((key) => mutedSet.has(key))) continue
+    return {
+      active: true,
+      severity: statusSeverity(item.title),
+      label: shortStatusLabel(item.title),
+      title: item.title,
+      components: item.components,
+      componentKeys: keys,
+      since: item.at === null ? null : beijingHm(item.at),
+      url: item.link === '' ? STATUS_PAGE_URL : item.link,
+      updatedAt: now,
+    }
   }
+  return idleStatus()
+}
+
+// 单条判定的入口（既有测试与调用仍用它）：等价于「只看这一条」。
+function evaluateStatusItem(item, now, muted = []) {
+  return evaluateStatusItems(item === null ? [] : [item], now, muted)
 }
 
 // 状态快照：TTL 取决于上一份快照是不是「有告警」——有告警时盯恢复要快（30s），无告警时
@@ -602,15 +768,20 @@ function evaluateStatusItem(item, now) {
 /** 服务状态的 TTL 分档：有告警时收紧（恢复要尽快翻牌），无告警时 5 分钟内不折腾 status 站。 */
 const statusTtlOf = (data) => (data.active === true ? STATUS_CHECK_TTL_ACTIVE_MS : STATUS_CHECK_TTL_MS)
 
-async function fetchStatusSnapshot() {
+/** 拉一次 feed 并判定；`mutedKey` 是静音组件的缓存键（见 mutedKeyOf）。 */
+async function fetchStatusSnapshot(mutedKey = '') {
   const response = await fetch(STATUS_FEED_URL, {
     headers: { Accept: 'application/rss+xml, application/xml;q=0.9, */*;q=0.8', 'User-Agent': UA },
     signal: AbortSignal.timeout(15000),
   })
   if (!response.ok) throw new Error(`status feed ${response.status}`)
-  const item = parseStatusFeed(await response.text())
-  if (item === null) throw new Error('status feed: no items')
-  return evaluateStatusItem(item, Date.now())
+  const items = parseStatusFeedItems(await response.text())
+  if (items.length === 0) throw new Error('status feed: no items')
+  return {
+    ...evaluateStatusItems(items, Date.now(), mutedKey === '' ? [] : mutedKey.split(',')),
+    // 设置页要的组件清单（标签来自 feed 里的真实组件名）：顺手带上，省掉第二次抓 feed
+    available: alertsOptions(items),
+  }
 }
 
 // 服务状态快照。抓不到就按「问不到 ≠ 出问题」返回空闲 —— 兜底形状与另外两处不同。
@@ -620,6 +791,9 @@ function createStatusSnapshot({ fetchSnapshot = fetchStatusSnapshot, now = Date.
 }
 
 const statusSnapshot = createStatusSnapshot()
+
+/** 请求体不合法（太大 / 不是 JSON）：路由层据此回 400 而不是 500。 */
+class BadRequest extends Error {}
 
 // ---------------------------------------------------------------------------
 // 插件主体
@@ -662,18 +836,48 @@ export async function apply(ctx) {
     return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
   }
 
+  /** 请求体不合法（太大 / 不是 JSON）——路由层要把它和「内部错误」分开回 400。 */
+  function readJsonBody(req) {
+    return new Promise((resolve, reject) => {
+      // 上限 4KB：只用来收一个组件数组，别让本机请求把进程内存拖住
+      const LIMIT = 4096
+      const chunks = []
+      let size = 0
+      req.on('data', (chunk) => {
+        size += chunk.length
+        if (size > LIMIT) {
+          reject(new BadRequest('body too large'))
+          return
+        }
+        chunks.push(chunk)
+      })
+      req.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        if (text.trim() === '') return resolve({})
+        try {
+          resolve(JSON.parse(text))
+        } catch {
+          reject(new BadRequest('invalid json'))
+        }
+      })
+      req.on('error', reject)
+    })
+  }
+
   /**
-   * 注册一个只读 GET 路由。
+   * 注册一个本地路由（默认只读 GET）。
    *
-   * 三个路由的四道检查完全一样——405 / 回环 / `Cache-Control: no-store` / 异常走 500——
-   * 只有「正常返回什么」不同。抽出来之后每个路由只剩「取数据」那一句（原先三份复制粘贴的
+   * 所有路由的四道检查完全一样——405 / 回环 / `Cache-Control: no-store` / 异常走 500——
+   * 只有「正常返回什么」不同。抽出来之后每个路由只剩「取数据」那一句（原先几份复制粘贴的
    * handler 共 120 行）。日志里保留各自的路由名，出错时还认得出是谁。
    *
    * @param name - 路由名（日志与 effect 标签用）。
    * @param path - 精确路径。
-   * @param getBody - 取返回体；抛错即 500（细节留在 Host 日志，不回给浏览器）。
+   * @param getBody - 取返回体，收到 `{ method, body }`；抛错即 500（细节留在 Host 日志，不回给浏览器）。
+   * @param methods - 允许的 HTTP 方法，默认只放 GET。
+   * @param json - 是否先把请求体读成 JSON（POST/PUT 用）。
    */
-  function route(name, path, getBody) {
+  function route(name, path, getBody, { methods = ['GET'], json = false } = {}) {
     return ctx.effect(() => server.register({
       kind: 'exact',
       path,
@@ -684,7 +888,7 @@ export async function apply(ctx) {
           res.end(JSON.stringify(body))
         }
         try {
-          if (req.method !== 'GET') {
+          if (!methods.includes(req.method)) {
             send(405, { ok: false, error: 'method not allowed' })
             return
           }
@@ -692,9 +896,14 @@ export async function apply(ctx) {
             send(403, { ok: false, error: 'forbidden' })
             return
           }
-          send(200, await getBody())
+          const body = json ? await readJsonBody(req) : undefined
+          send(200, await getBody({ method: req.method, body }))
         } catch (err) {
-          // 只回稳定错误码，细节留在 Host 日志
+          // 请求体不合法是调用方的问题（400），其余一律 500：细节留在 Host 日志
+          if (err instanceof BadRequest) {
+            send(400, { ok: false, error: 'bad request' })
+            return
+          }
           ctx.logger.warn(`usage-stats: ${name} route failed: ${String(err)}`)
           send(500, { ok: false, error: 'internal' })
         }
@@ -741,9 +950,59 @@ export async function apply(ctx) {
 
     // 服务状态：抓取在 Host 做——status.deepseek.com 无 CORS 头，浏览器端直接 fetch 拿不到；
     // Host 侧结果有缓存（无告警 5 分钟 / 有告警 30 秒），客户端按同样的节奏轮询。
-    route('status', STATUS_ROUTE, () => statusSnapshot())
+    // 静音组件进缓存键：改了设置就是另一份快照，不必等旧缓存过期。
+    route('status', STATUS_ROUTE, () => statusSnapshot(mutedKeyOf(readAlertsSettings().muted)))
+
+    // 告警设置：设置页读写。GET 返回可订阅组件（来自官方「受影响组件」）+ 当前静音项；
+    // POST 整份覆盖静音项（幂等，便于以后加字段）。只动 SETTINGS_FILE，不碰 token 文件。
+    route('alerts', ALERTS_ROUTE, async ({ method, body }) => {
+      if (method === 'GET') {
+        const snapshot = await statusSnapshot('') // key '' = 不静音任何组件，顺带拿到全量组件清单
+        return {
+          ok: true,
+          muted: readAlertsSettings().muted,
+          options: Array.isArray(snapshot.available) ? snapshot.available : alertsOptions([]),
+        }
+      }
+      // POST：`muted` 必须是数组；未知/非法组件键由 normalizeMuted 丢弃（不报错，宽松写）
+      if (body === null || typeof body !== 'object' || Array.isArray(body)) throw new BadRequest('body must be an object')
+      if (body.muted !== undefined && !Array.isArray(body.muted)) throw new BadRequest('muted must be an array')
+      const saved = writeAlertsSettings(body.muted ?? [])
+      return { ok: true, muted: saved.muted }
+    }, { methods: ['GET', 'POST'], json: true })
   }
 }
 
 // 仅供本地校验解析与缓存策略（判据来自真实 feed 的真实形状）
-export const __test = { cached, createTokenResolver, parseStatusFeed, evaluateStatusItem, shortStatusLabel, statusSeverity, isApiRelevantComponent, decodeXml, createStatusSnapshot, compareVersions, parseVersion, isAlphaVersion, createUpdateSnapshot, updateInfo, statusTtlOf, idleStatus, fetchLatestDshVersion }
+export const __test = {
+  cached,
+  createTokenResolver,
+  parseStatusFeed,
+  parseStatusFeedItems,
+  evaluateStatusItem,
+  evaluateStatusItems,
+  componentKeys,
+  componentKeyOf,
+  componentLabelOf,
+  componentGroupOf,
+  alertsOptions,
+  COMPONENT_KEYS,
+  DEFAULT_MUTED,
+  normalizeMuted,
+  readAlertsSettings,
+  writeAlertsSettings,
+  mutedKeyOf,
+  shortStatusLabel,
+  statusSeverity,
+  decodeXml,
+  createStatusSnapshot,
+  compareVersions,
+  parseVersion,
+  isAlphaVersion,
+  createUpdateSnapshot,
+  updateInfo,
+  statusTtlOf,
+  idleStatus,
+  fetchLatestDshVersion,
+  SETTINGS_FILE,
+}
